@@ -4,6 +4,7 @@
 #include <fstream>
 #include <sstream>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -21,27 +22,41 @@ namespace {
 
 // 配置页：优先从 <exedir>/assets/config_page.html 读取，离线可用；缺失则用内嵌最小页。
 std::string loadConfigPage() {
-  // 定位 exe 同目录
-  std::string exeDir;
+  // 候选目录：exe 同目录、exe 上级目录（适配 build/Release + build/assets 布局）、当前工作目录
+  std::vector<std::string> dirs;
 #ifdef _WIN32
   char buf[MAX_PATH] = {0};
   if (GetModuleFileNameA(nullptr, buf, MAX_PATH)) {
     std::string s(buf);
-    exeDir = s.substr(0, s.find_last_of("/\\"));
+    std::string exeDir = s.substr(0, s.find_last_of("/\\"));
+    dirs.push_back(exeDir);
+    auto pos = exeDir.find_last_of("/\\");
+    if (pos != std::string::npos) dirs.push_back(exeDir.substr(0, pos));
   }
 #else
   char buf[1024] = {0};
   if (readlink("/proc/self/exe", buf, sizeof(buf)) > 0) {
     std::string s(buf);
-    exeDir = s.substr(0, s.find_last_of("/\\"));
+    std::string exeDir = s.substr(0, s.find_last_of("/\\"));
+    dirs.push_back(exeDir);
+    auto pos = exeDir.find_last_of("/\\");
+    if (pos != std::string::npos) dirs.push_back(exeDir.substr(0, pos));
   }
 #endif
-  std::string p = exeDir + "/assets/config_page.html";
-  std::ifstream f(p, std::ios::binary);
-  if (f) {
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
+  dirs.push_back(".");
+
+  std::vector<std::string> tried;
+  for (auto& d : dirs) {
+    bool dup = false;
+    for (auto& t : tried) if (t == d) { dup = true; break; }
+    if (dup) continue;
+    tried.push_back(d);
+    std::ifstream f(d + "/assets/config_page.html", std::ios::binary);
+    if (f) {
+      std::stringstream ss;
+      ss << f.rdbuf();
+      return ss.str();
+    }
   }
   return "<!DOCTYPE html><html><head><meta charset='utf-8'><title>cpp-daemon</title></head>"
          "<body><h1>cpp-daemon</h1><p>配置页资源 assets/config_page.html 未找到。</p>"
