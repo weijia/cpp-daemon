@@ -1,0 +1,13 @@
+[requires]
+openssl/3.3.2
+nlohmann_json/3.11.3
+cpp-httplib/0.18.1
+paho-mqtt-cpp/1.4.0
+
+[options]
+cpp-httplib/*:with_openssl=True
+paho-mqtt-cpp/*:ssl=True
+
+[generators]
+CMakeDeps
+CMakeToolchain

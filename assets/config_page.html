@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cpp-daemon 配置</title>
+<style>
+  :root{--primary:#2563EB;--primary-d:#1D4ED8;--bg:#F5F7FA;--card:#FFFFFF;--text:#1F2937;--muted:#6B7280;--green:#16A34A;--red:#DC2626}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:"PingFang SC",-apple-system,"Microsoft YaHei",sans-serif;background:linear-gradient(160deg,#EEF2FF 0%,var(--bg) 40%);color:var(--text);min-height:100vh;padding:32px 16px}
+  .wrap{max-width:680px;margin:0 auto}
+  header{background:linear-gradient(135deg,var(--primary),var(--primary-d));color:#fff;border-radius:18px;padding:22px 26px;box-shadow:0 12px 30px rgba(37,99,235,.25);display:flex;align-items:center;justify-content:space-between}
+  header h1{margin:0;font-size:22px;font-weight:600}
+  header p{margin:4px 0 0;opacity:.85;font-size:13px}
+  .badge{font-size:13px;font-weight:600;padding:7px 14px;border-radius:999px;background:rgba(255,255,255,.18);transition:.2s}
+  .badge.ok{background:rgba(22,163,74,.9)} .badge.err{background:rgba(220,38,38,.9)}
+  .card{background:var(--card);border-radius:16px;padding:20px 22px;margin-top:18px;box-shadow:0 6px 18px rgba(17,24,39,.06)}
+  .card h2{margin:0 0 14px;font-size:15px;font-weight:600;color:var(--primary);display:flex;align-items:center;gap:8px}
+  .card h2::before{content:"";width:4px;height:16px;background:var(--primary);border-radius:2px;display:inline-block}
+  label{display:block;font-size:13px;color:var(--muted);margin:12px 0 6px}
+  input[type=text],input[type=number],input[type=password],select{width:100%;padding:10px 12px;border:1px solid #E5E7EB;border-radius:10px;font-size:14px;color:var(--text);background:#FCFCFD}
+  input:focus,select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.15)}
+  input:disabled{background:#F3F4F6;color:#9CA3AF}
+  .checkbox{display:flex;align-items:center;gap:8px;margin-top:14px;font-size:14px}
+  .checkbox input{width:16px;height:16px;accent-color:var(--primary)}
+  .actions{display:flex;gap:12px;margin-top:22px;flex-wrap:wrap}
+  button{cursor:pointer;border:none;border-radius:11px;padding:12px 20px;font-size:14px;font-weight:600;font-family:inherit}
+  .btn-primary{background:linear-gradient(135deg,var(--primary),var(--primary-d));color:#fff;box-shadow:0 8px 18px rgba(37,99,235,.28)}
+  .btn-ghost{background:#EEF2FF;color:var(--primary)}
+  .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%) translateY(20px);background:#111827;color:#fff;padding:12px 20px;border-radius:12px;font-size:14px;opacity:0;pointer-events:none;transition:.25s;max-width:90vw}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  .hint{font-size:12px;color:var(--muted);margin-top:6px;line-height:1.5}
+  footer{text-align:center;color:var(--muted);font-size:12px;margin-top:22px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div><h1>cpp-daemon</h1><p>插件化上报代理 · 本地配置</p></div>
+    <div id="badge" class="badge">加载中…</div>
+  </header>
+  <form id="form" autocomplete="off">
+    <div class="card">
+      <h2>本节点</h2>
+      <label>UUID（节点唯一标识，自动生成）</label>
+      <input type="text" id="uuid" disabled>
+      <label>显示名称</label>
+      <input type="text" id="name" placeholder="节点名称">
+      <label class="checkbox"><input type="checkbox" id="autostart"> 开机自动启动（Windows 登录后自动运行）</label>
+      <div class="hint">勾选后写入系统自启项（Windows 注册表 Run）；取消则从自启项移除。仅 Windows 生效。</div>
+    </div>
+    <div class="card">
+      <h2>本地服务</h2>
+      <label>HTTP 监听地址（仅本机）</label>
+      <input type="text" id="http_listen" placeholder="127.0.0.1:9801">
+      <div class="hint">修改监听地址保存后会自动重启本地服务。</div>
+    </div>
+    <div id="pluginWrap"></div>
+    <div class="actions">
+      <button type="submit" class="btn-primary">保存并应用</button>
+      <button type="button" class="btn-ghost" id="updateBtn">立即上报</button>
+    </div>
+  </form>
+  <footer>cpp-daemon · 状态每间隔自动上报至 RemoteStorage 服务器</footer>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+var $ = function(id){ return document.getElementById(id); };
+var schemas = {};
+function toast(msg){ var t=$('toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(t._t); t._t=setTimeout(function(){ t.classList.remove('show'); },2600); }
+function getNested(o, path){ var parts=path.split('.'); var cur=o; for(var i=0;i<parts.length;i++){ if(cur==null) return ''; cur=cur[parts[i]]; } return cur; }
+function setNested(o, path, val){ var parts=path.split('.'); var cur=o; for(var i=0;i<parts.length-1;i++){ var k=parts[i]; if(typeof cur[k]!=='object'||cur[k]==null) cur[k]={}; cur=cur[k]; } cur[parts[parts.length-1]]=val; }
+function renderPlugins(sc, config){
+  var wrap=$('pluginWrap'); wrap.innerHTML='';
+  Object.keys(sc).forEach(function(name){
+    var s=sc[name]; var card=document.createElement('div'); card.className='card';
+    var h=document.createElement('h2'); h.textContent=s.Title; card.appendChild(h);
+    var bucket=(config.plugins&&config.plugins[name])?config.plugins[name]:{};
+    (s.Fields||[]).forEach(function(f){ card.appendChild(renderField(name,f,bucket)); });
+    wrap.appendChild(card);
+  });
+}
+function renderField(name,f,bucket){
+  var wrap=document.createElement('div'); var label=document.createElement('label'); label.textContent=f.Label; wrap.appendChild(label);
+  var id='f_'+name+'_'+f.Key; var el;
+  if(f.Type==='bool'){ el=document.createElement('input'); el.type='checkbox'; el.checked=!!getNested(bucket,f.Key); }
+  else if(f.Type==='number'){ el=document.createElement('input'); el.type='number'; var v=getNested(bucket,f.Key); el.value=(v==null?'':v); }
+  else if(f.Type==='select'){ el=document.createElement('select'); (f.Options||[]).forEach(function(o){ var op=document.createElement('option'); op.value=o; op.textContent=o; if(getNested(bucket,f.Key)===o) op.selected=true; el.appendChild(op); }); }
+  else { el=document.createElement('input'); el.type=(f.Type==='password'?'password':'text'); var vv=getNested(bucket,f.Key); el.value=(vv==null?'':vv); }
+  el.id=id; wrap.appendChild(el);
+  if(f.Hint){ var hint=document.createElement('div'); hint.className='hint'; hint.textContent=f.Hint; wrap.appendChild(hint); }
+  return wrap;
+}
+function collectPlugins(sc){
+  var plugins={};
+  Object.keys(sc).forEach(function(name){
+    var s=sc[name]; var bucket={};
+    (s.Fields||[]).forEach(function(f){
+      var el=document.getElementById('f_'+name+'_'+f.Key); if(!el) return;
+      if(f.Type==='bool') setNested(bucket,f.Key,el.checked);
+      else if(f.Type==='number') setNested(bucket,f.Key,parseInt(el.value,10)||0);
+      else setNested(bucket,f.Key,el.value);
+    });
+    plugins[name]=bucket;
+  });
+  return plugins;
+}
+function load(){
+  fetch('/api/config').then(function(r){ return r.json(); }).then(function(d){
+    var cfg=d.config||{}; schemas=d.schemas||{};
+    $('uuid').value=cfg.uuid||''; $('name').value=cfg.name||''; $('autostart').checked=!!cfg.autostart;
+    $('http_listen').value=(cfg.http?cfg.http.listen:'');
+    renderPlugins(schemas,cfg); loadStatus();
+  }).catch(function(e){ toast('加载失败: '+e.message); });
+}
+function loadStatus(){
+  fetch('/api/status').then(function(r){ return r.json(); }).then(function(st){ updateBadge(st.status); }).catch(function(){});
+}
+function updateBadge(s){
+  var b=$('badge');
+  if(!s||!s.last_attempt){ b.textContent='未上报'; b.className='badge'; return; }
+  var t=new Date(s.last_attempt).toLocaleString();
+  if(s.last_success){ b.textContent='上次上报成功 '+t; b.className='badge ok'; }
+  else { b.textContent='上次上报失败 '+t; b.className='badge err'; }
+}
+$('form').addEventListener('submit', function(e){
+  e.preventDefault();
+  var data={ uuid:$('uuid').value, name:$('name').value, autostart:$('autostart').checked, http:{listen:$('http_listen').value}, plugins:collectPlugins(schemas) };
+  fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
+    .then(function(r){ return r.json(); }).then(function(d){ if(!d.ok){ toast('保存失败: '+(d.error||'')); } else { toast('已保存并应用'); load(); } })
+    .catch(function(e){ toast('保存失败: '+e.message); });
+});
+$('updateBtn').addEventListener('click', function(){
+  fetch('/api/update',{method:'POST'}).then(function(r){ return r.json(); }).then(function(d){ if(d.ok) toast('上报成功'); else toast('上报失败: '+(d.error||'')); loadStatus(); })
+    .catch(function(e){ toast('上报失败: '+e.message); });
+});
+load();
+</script>
+</body>
+</html>

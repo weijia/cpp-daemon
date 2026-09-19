@@ -1,0 +1,4 @@
+#include <winuser.h>
+
+// 托盘图标：与 go-daemon 共用 appicon_tray.png，运行时包成 ICO（见 Tray.cpp）
+IDR_TRAY_PNG RCDATA "assets\\appicon_tray.png"
