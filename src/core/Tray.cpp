@@ -13,6 +13,8 @@
 #endif
 #include <windows.h>
 #include <shellapi.h>
+#include <gdiplus.h>
+#pragma comment(lib, "gdiplus.lib")
 #endif
 #endif
 
@@ -40,8 +42,9 @@ std::wstring utf8ToWide(const std::string& s) {
   return w;
 }
 
-// 从嵌入资源读取 appicon_tray.png，包成 ICO 容器，取 HICON
-// （与 go-daemon 的 pngToICO 完全一致的 ICO 布局）
+// 从嵌入资源读取 appicon_tray.png，用 GDI+ 解码为带 alpha 的 HICON。
+// （与 go-daemon 共用同一张 PNG；GDI+ 能正确处理 32 位带透明通道 PNG，
+//   比手动把 PNG 包成 ICO 再 CreateIconFromResourceEx 可靠得多。）
 HICON loadTrayIcon() {
   HMODULE hMod = GetModuleHandleA(nullptr);
   HRSRC hRes = FindResourceA(hMod, "IDR_TRAY_PNG", RT_RCDATA);
@@ -52,33 +55,37 @@ HICON loadTrayIcon() {
   const BYTE* png = (const BYTE*)LockResource(hGlob);
   if (!png || pngSize == 0) return nullptr;
 
-  std::vector<BYTE> ico;
-  ico.reserve(22 + pngSize);
-  auto put16 = [&](uint16_t v) {
-    ico.push_back((BYTE)(v & 0xFF));
-    ico.push_back((BYTE)((v >> 8) & 0xFF));
-  };
-  auto put32 = [&](uint32_t v) {
-    ico.push_back((BYTE)(v & 0xFF));
-    ico.push_back((BYTE)((v >> 8) & 0xFF));
-    ico.push_back((BYTE)((v >> 16) & 0xFF));
-    ico.push_back((BYTE)((v >> 24) & 0xFF));
-  };
-  put16(0);     // reserved
-  put16(1);     // type = icon
-  put16(1);     // count = 1
-  ico.push_back(0);  // width
-  ico.push_back(0);  // height
-  ico.push_back(0);  // colors
-  ico.push_back(0);  // reserved
-  put16(1);     // planes
-  put16(32);    // bpp
-  put32(pngSize);  // image size
-  put32(22);    // image data offset = 6(header) + 16(direntry)
-  ico.insert(ico.end(), png, png + pngSize);
+  // 把资源内存包成 IStream 交给 GDI+ 解码
+  HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, pngSize);
+  if (!hMem) return nullptr;
+  void* pMem = GlobalLock(hMem);
+  memcpy(pMem, png, pngSize);
+  GlobalUnlock(hMem);
+  IStream* pStream = nullptr;
+  if (FAILED(CreateStreamOnHGlobal(hMem, TRUE, &pStream)) || !pStream) {
+    GlobalFree(hMem);
+    return nullptr;
+  }
 
-  return CreateIconFromResourceEx(ico.data(), (DWORD)ico.size(), TRUE,
-                                  0x00030000, 0, 0, LR_DEFAULTCOLOR);
+  Gdiplus::GdiplusStartupInput gsi;
+  ULONG_PTR token = 0;
+  Gdiplus::GdiplusStartup(&token, &gsi, nullptr);
+
+  Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromStream(pStream);
+  pStream->Release();
+  HICON hIcon = nullptr;
+  if (bmp && bmp->GetLastStatus() == Gdiplus::Ok) {
+    // 缩放到 32x32，托盘显示更清晰
+    Gdiplus::Bitmap scaled(32, 32, PixelFormat32bppARGB);
+    Gdiplus::Graphics g(&scaled);
+    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    g.DrawImage(bmp, 0, 0, 32, 32);
+    scaled.GetHICON(&hIcon);
+  }
+  delete bmp;
+  Gdiplus::GdiplusShutdown(token);
+  return hIcon;
 }
 
 }  // namespace
