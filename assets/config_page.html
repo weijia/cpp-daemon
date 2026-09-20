@@ -74,32 +74,32 @@ function renderPlugins(sc, config){
   var wrap=$('pluginWrap'); wrap.innerHTML='';
   Object.keys(sc).forEach(function(name){
     var s=sc[name]; var card=document.createElement('div'); card.className='card';
-    var h=document.createElement('h2'); h.textContent=s.Title; card.appendChild(h);
+    var h=document.createElement('h2'); h.textContent=s.title; card.appendChild(h);
     var bucket=(config.plugins&&config.plugins[name])?config.plugins[name]:{};
-    (s.Fields||[]).forEach(function(f){ card.appendChild(renderField(name,f,bucket)); });
+    (s.fields||[]).forEach(function(f){ card.appendChild(renderField(name,f,bucket)); });
     wrap.appendChild(card);
   });
 }
 function renderField(name,f,bucket){
-  var wrap=document.createElement('div'); var label=document.createElement('label'); label.textContent=f.Label; wrap.appendChild(label);
-  var id='f_'+name+'_'+f.Key; var el;
-  if(f.Type==='bool'){ el=document.createElement('input'); el.type='checkbox'; el.checked=!!getNested(bucket,f.Key); }
-  else if(f.Type==='number'){ el=document.createElement('input'); el.type='number'; var v=getNested(bucket,f.Key); el.value=(v==null?'':v); }
-  else if(f.Type==='select'){ el=document.createElement('select'); (f.Options||[]).forEach(function(o){ var op=document.createElement('option'); op.value=o; op.textContent=o; if(getNested(bucket,f.Key)===o) op.selected=true; el.appendChild(op); }); }
-  else { el=document.createElement('input'); el.type=(f.Type==='password'?'password':'text'); var vv=getNested(bucket,f.Key); el.value=(vv==null?'':vv); }
+  var wrap=document.createElement('div'); var label=document.createElement('label'); label.textContent=f.label; wrap.appendChild(label);
+  var id='f_'+name+'_'+f.key; var el;
+  if(f.type==='bool'){ el=document.createElement('input'); el.type='checkbox'; el.checked=!!getNested(bucket,f.key); }
+  else if(f.type==='number'){ el=document.createElement('input'); el.type='number'; var v=getNested(bucket,f.key); el.value=(v==null?'':v); }
+  else if(f.type==='select'){ el=document.createElement('select'); (f.options||[]).forEach(function(o){ var op=document.createElement('option'); op.value=o; op.textContent=o; if(getNested(bucket,f.key)===o) op.selected=true; el.appendChild(op); }); }
+  else { el=document.createElement('input'); el.type=(f.type==='password'?'password':'text'); var vv=getNested(bucket,f.key); el.value=(vv==null?'':vv); }
   el.id=id; wrap.appendChild(el);
-  if(f.Hint){ var hint=document.createElement('div'); hint.className='hint'; hint.textContent=f.Hint; wrap.appendChild(hint); }
+  if(f.hint){ var hint=document.createElement('div'); hint.className='hint'; hint.textContent=f.hint; wrap.appendChild(hint); }
   return wrap;
 }
 function collectPlugins(sc){
   var plugins={};
   Object.keys(sc).forEach(function(name){
     var s=sc[name]; var bucket={};
-    (s.Fields||[]).forEach(function(f){
-      var el=document.getElementById('f_'+name+'_'+f.Key); if(!el) return;
-      if(f.Type==='bool') setNested(bucket,f.Key,el.checked);
-      else if(f.Type==='number') setNested(bucket,f.Key,parseInt(el.value,10)||0);
-      else setNested(bucket,f.Key,el.value);
+    (s.fields||[]).forEach(function(f){
+      var el=document.getElementById('f_'+name+'_'+f.key); if(!el) return;
+      if(f.type==='bool') setNested(bucket,f.key,el.checked);
+      else if(f.type==='number') setNested(bucket,f.key,parseInt(el.value,10)||0);
+      else setNested(bucket,f.key,el.value);
     });
     plugins[name]=bucket;
   });
