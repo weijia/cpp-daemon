@@ -111,6 +111,16 @@ public:
 }  // namespace cppdaemon
 
 // C-ABI 工厂：每个插件动态库导出这两个符号。
+// Windows 必须用 __declspec(dllexport) 才会把符号导出到 DLL 导出表；
+// GCC/Clang 在 -fvisibility=hidden 下需用 visibility("default") 覆盖。
+#if defined(_WIN32)
+#define CPPD_PLUGIN_API __declspec(dllexport)
+#elif defined(__GNUC__)
+#define CPPD_PLUGIN_API __attribute__((visibility("default")))
+#else
+#define CPPD_PLUGIN_API
+#endif
+
 extern "C" {
 using create_plugin_fn = cppdaemon::Plugin* (*)();
 using destroy_plugin_fn = void (*)(cppdaemon::Plugin*);

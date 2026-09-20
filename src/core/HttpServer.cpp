@@ -20,8 +20,30 @@ namespace cppdaemon {
 
 namespace {
 
-// 配置页：优先从 <exedir>/assets/config_page.html 读取，离线可用；缺失则用内嵌最小页。
+// 从嵌入资源（RCDATA）读取字符串，失败返回空串
+std::string loadResourceString(const char* name) {
+#ifdef _WIN32
+  HMODULE hMod = GetModuleHandleA(nullptr);
+  HRSRC hRes = FindResourceA(hMod, name, RT_RCDATA);
+  if (!hRes) return {};
+  HGLOBAL hGlob = LoadResource(hMod, hRes);
+  if (!hGlob) return {};
+  DWORD size = SizeofResource(hMod, hRes);
+  const char* p = (const char*)LockResource(hGlob);
+  if (!p || size == 0) return {};
+  return std::string(p, size);
+#else
+  (void)name;
+  return {};
+#endif
+}
+
+// 配置页：优先从内嵌资源读取（exe 自包含，单文件分发）；
+// 回退到 <exedir>/assets/config_page.html（开发期未重编资源时仍可用）。
 std::string loadConfigPage() {
+  std::string fromRes = loadResourceString("IDR_CONFIG_PAGE");
+  if (!fromRes.empty()) return fromRes;
+
   // 候选目录：exe 同目录、exe 上级目录（适配 build/Release + build/assets 布局）、当前工作目录
   std::vector<std::string> dirs;
 #ifdef _WIN32

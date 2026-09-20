@@ -66,7 +66,8 @@ Config defaultConfig() {
 // ---------- json 互转 ----------
 void toJson(const RemoteStorageConfig& c, nlohmann::json& j) {
   j = {{"server", c.server}, {"user", c.user}, {"token", c.token},
-       {"scope", c.scope}, {"path_template", c.pathTemplate}};
+       {"scope", c.scope}, {"path_template", c.pathTemplate},
+       {"proxy", c.proxy}};
 }
 void toJson(const ReportConfig& c, nlohmann::json& j) {
   j = {{"interval_minutes", c.intervalMinutes}, {"extra_info", c.extraInfo}};
@@ -93,6 +94,7 @@ ReporterConfig reporterFromJson(const nlohmann::json& j) {
     c.remotestorage.token = rs.value("token", "");
     c.remotestorage.scope = rs.value("scope", "");
     c.remotestorage.pathTemplate = rs.value("path_template", "");
+    c.remotestorage.proxy = rs.value("proxy", "");
   }
   if (j.contains("report")) {
     auto& rp = j["report"];

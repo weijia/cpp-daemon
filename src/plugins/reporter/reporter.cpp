@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdarg>
 #include <ctime>
 #include <map>
 #include <mutex>
@@ -20,6 +21,7 @@
 #include <mqtt/async_client.h>
 
 #ifdef _WIN32
+#include <windows.h>
 #include <iphlpapi.h>
 #define RUN_POPEN _popen
 #define RUN_PCLOSE _pclose
@@ -113,6 +115,91 @@ struct UploadError {
 std::string uploadErrMsg(const UploadError& e) {
   static const char* names[] = {"network", "auth", "server", "invalid"};
   return std::string(names[e.kind]) + ": " + e.msg;
+}
+
+// 将完整 URL 拆成 httplib 需要的两段：base(https://host[:port]) + path(/x/y)
+void splitURL(const std::string& url, std::string& base, std::string& path) {
+  size_t start = 0;
+  if (url.compare(0, 7, "http://") == 0) start = 7;
+  else if (url.compare(0, 8, "https://") == 0) start = 8;
+  size_t slash = url.find('/', start);
+  if (slash == std::string::npos) {
+    base = url;
+    path = "/";
+  } else {
+    base = url.substr(0, slash);
+    path = url.substr(slash);
+  }
+}
+
+// httplib 错误枚举转可读字符串，便于排查 DNS/TLS/超时等网络问题
+// （不同版本 httplib 不一定提供 to_string，故只输出错误码，用户可据此回传定位）
+std::string httpErr(const httplib::Result& r) {
+  if (r) return "ok";
+  int code = static_cast<int>(r.error());
+  std::string msg = "httplib错误码#" + std::to_string(code);
+  if (code == 2)  // Error::Connection：TCP 建连失败
+    msg += "(连接失败: 检查主机名/DNS/端口是否可达, 或是否需要代理)";
+  return msg;
+}
+
+// 解析代理配置 "http://host:port" 或 "host:port" -> (host, port)
+bool parseProxy(const std::string& proxy, std::string& host, int& port) {
+  std::string s = proxy;
+  size_t d = s.find("://");
+  if (d != std::string::npos) s = s.substr(d + 3);
+  size_t c = s.rfind(':');
+  if (c == std::string::npos || c + 1 >= s.size()) return false;
+  try { port = std::stoi(s.substr(c + 1)); }
+  catch (...) { return false; }
+  host = s.substr(0, c);
+  return !host.empty() && port > 0;
+}
+
+// 读取系统代理环境变量（httplib 默认不读，需要显式设置）
+std::string envProxy() {
+  const char* names[] = {"HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"};
+  for (auto n : names) {
+    const char* v = std::getenv(n);
+    if (v && *v) return v;
+  }
+  return "";
+}
+
+// ---------- 持久化日志（同时写文件与 stderr） ----------
+// 日志文件位于 exe 同目录：cpp-daemon.log
+static std::string logFilePath() {
+#ifdef _WIN32
+  char buf[MAX_PATH] = {0};
+  DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+  std::string s(buf, n);
+  size_t p = s.find_last_of("\\/");
+  s = (p == std::string::npos) ? "." : s.substr(0, p);
+  return s + "\\cpp-daemon.log";
+#else
+  return "cpp-daemon.log";
+#endif
+}
+static FILE* g_logf = nullptr;
+static void rlog(const char* fmt, ...) {
+  char ts[32];
+  time_t t = time(nullptr);
+  struct tm tm_buf;
+#ifdef _WIN32
+  localtime_s(&tm_buf, &t);
+#else
+  localtime_r(&t, &tm_buf);
+#endif
+  strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_buf);
+  va_list ap;
+  if (!g_logf) g_logf = fopen(logFilePath().c_str(), "a");
+  if (g_logf) {
+    fprintf(g_logf, "[%s] ", ts);
+    va_start(ap, fmt); vfprintf(g_logf, fmt, ap); va_end(ap);
+    fflush(g_logf);
+  }
+  fprintf(stderr, "[%s] ", ts);
+  va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
 }
 
 }  // namespace
@@ -241,6 +328,7 @@ public:
         {"remotestorage.user", "用户 User", "text"},
         {"remotestorage.token", "Bearer Token", "password"},
         {"remotestorage.path_template", "路径模板 PathTemplate", "text", "支持 {user} {uuid}"},
+        {"remotestorage.proxy", "代理 Proxy（可选）", "text", "公司网络需填写，如 http://proxy:8080；留空则自动读取系统代理环境变量"},
         {"report.interval_minutes", "上报间隔（分钟）", "number"},
         {"report.extra_info", "附带本机基础信息", "bool"},
         {"mqtt.enabled", "启用 MQTT", "bool"},
@@ -329,7 +417,7 @@ private:
     std::string err;
     bool ok = sync(c, err);
     setState(ok, err);
-    if (!ok) std::fprintf(stderr, "[reporter] 上报失败: %s\n", err.c_str());
+    if (!ok) rlog("[reporter] 上报失败: %s\n", err.c_str());
     return ok;
   }
 
@@ -379,14 +467,33 @@ private:
       return false;
     }
     // 每次同步用本地客户端，避免 host 绑定陈旧
-    httplib::Client cli(url);
+    std::string base, path;
+    splitURL(url, base, path);
+    if (base.empty()) {
+      err = uploadErrMsg({UploadError::Invalid,
+        "remotestorage.server 未配置（请在配置页填写服务器地址，需含 http(s)://）"});
+      rlog("[reporter] 上报失败: %s\n", err.c_str());
+      return false;
+    }
+    rlog("[reporter] 同步 GET base=%s path=%s\n", base.c_str(), path.c_str());
+    httplib::Client cli(base);
     cli.enable_server_certificate_verification(true);
+    // 可选代理（公司网络常见需要）
+    std::string ph; int pp = 0;
+    std::string proxy = c.remotestorage.proxy;
+    if (proxy.empty()) proxy = envProxy();
+    if (!proxy.empty() && parseProxy(proxy, ph, pp)) {
+      cli.set_proxy(ph, pp);
+      rlog("[reporter] 使用代理 %s:%d\n", ph.c_str(), pp);
+    } else if (!c.remotestorage.proxy.empty()) {
+      rlog("[reporter] 代理配置无效: %s\n", c.remotestorage.proxy.c_str());
+    }
 
     // GET 现有节点
     httplib::Headers hdr;
     if (!c.remotestorage.token.empty())
       hdr.emplace("Authorization", "Bearer " + c.remotestorage.token);
-    auto gres = cli.Get(url, hdr);
+    auto gres = cli.Get(path, hdr);
     nlohmann::json existing;
     bool exists = false;
     if (gres) {
@@ -408,7 +515,7 @@ private:
         }
       }
     } else {
-      err = uploadErrMsg({UploadError::Network, "GET 失败"});
+      err = uploadErrMsg({UploadError::Network, "GET 失败: " + httpErr(gres)});
       return false;
     }
 
@@ -420,9 +527,9 @@ private:
     std::vector<Command> toExec = execInbox(payload);
     std::string body = nlohmann::json(payload).dump();
 
-    auto pres = cli.Put(url, hdr, body, "application/json");
+    auto pres = cli.Put(path, hdr, body, "application/json");
     if (!pres) {
-      err = uploadErrMsg({UploadError::Network, "PUT 失败"});
+      err = uploadErrMsg({UploadError::Network, "PUT 失败: " + httpErr(pres)});
       return false;
     }
     if (pres->status < 200 || pres->status >= 300) {
@@ -437,12 +544,13 @@ private:
       std::string mode;
       if (cmd.params.contains("mode")) mode = cmd.params["mode"].get<std::string>();
       if (!execPower(mode)) {
-        std::fprintf(stderr, "[reporter] 执行电源命令失败 mode=%s\n", mode.c_str());
+        rlog("[reporter] 执行电源命令失败 mode=%s\n", mode.c_str());
         markFailed(payload, cmd.cmdId, "执行失败: " + mode);
         auto ub = nlohmann::json(payload).dump();
-        cli.Put(url, hdr, ub, "application/json");
+        cli.Put(path, hdr, ub, "application/json");
       }
     }
+    rlog("[reporter] 上报成功\n");
     return true;
   }
 
@@ -576,7 +684,7 @@ private:
       mqttCli_.reset();
     }
     if (!c.mqtt.enabled || c.mqtt.broker.empty()) {
-      std::fprintf(stderr, "[reporter] MQTT 未启用或未配置 Broker\n");
+      rlog("[reporter] MQTT 未启用或未配置 Broker\n");
       return;
     }
     std::string topic = c.mqtt.topic.empty() ? kDefaultTopic : c.mqtt.topic;
@@ -598,18 +706,18 @@ private:
         void connected(const std::string&) override {
           try {
             r->mqttCli_->subscribe(topic, 1)->wait();
-            std::fprintf(stderr, "[reporter] MQTT 已订阅 %s\n", topic.c_str());
+            rlog("[reporter] MQTT 已订阅 %s\n", topic.c_str());
           } catch (const std::exception& e) {
-            std::fprintf(stderr, "[reporter] MQTT 订阅失败: %s\n", e.what());
+            rlog("[reporter] MQTT 订阅失败: %s\n", e.what());
           }
         }
         void connection_lost(const std::string& cause) override {
-          std::fprintf(stderr, "[reporter] MQTT 连接丢失: %s\n", cause.c_str());
+          rlog("[reporter] MQTT 连接丢失: %s\n", cause.c_str());
         }
         void message_arrived(mqtt::const_message_ptr m) override {
           std::string plain;
           if (!reporter::decryptAES(secret, m->to_string(), plain)) {
-            std::fprintf(stderr, "[reporter] MQTT 解密失败\n");
+            rlog("[reporter] MQTT 解密失败\n");
             return;
           }
           r->handleMQTT(plain);
@@ -632,7 +740,7 @@ private:
       try { mqttCli_->disconnect()->wait(); } catch (...) {}
       mqttCli_.reset();
     } catch (const std::exception& e) {
-      std::fprintf(stderr, "[reporter] MQTT 初始化失败: %s\n", e.what());
+      rlog("[reporter] MQTT 初始化失败: %s\n", e.what());
     }
   }
 
@@ -676,7 +784,7 @@ private:
     try {
       mqttCli_->publish(mqtt::make_message(cfg_.mqtt.topic + "/reply", cipher, 1, false));
     } catch (const std::exception& ex) {
-      std::fprintf(stderr, "[reporter] MQTT 回执失败: %s\n", ex.what());
+      rlog("[reporter] MQTT 回执失败: %s\n", ex.what());
     }
   }
 };
@@ -684,5 +792,5 @@ private:
 }  // namespace reporter
 
 // ---------- C-ABI 工厂 ----------
-extern "C" cppdaemon::Plugin* create_plugin() { return new reporter::Reporter(); }
-extern "C" void destroy_plugin(cppdaemon::Plugin* p) { delete p; }
+extern "C" CPPD_PLUGIN_API cppdaemon::Plugin* create_plugin() { return new reporter::Reporter(); }
+extern "C" CPPD_PLUGIN_API void destroy_plugin(cppdaemon::Plugin* p) { delete p; }

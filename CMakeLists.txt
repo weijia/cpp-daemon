@@ -60,11 +60,7 @@ if(WIN32)
   target_sources(cpp-daemon PRIVATE resources.rc)
 endif()
 
-# 把配置页资源拷到 exe 同目录（assets/config_page.html），保证运行时能被找到
-add_custom_command(TARGET cpp-daemon POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy_directory
-          ${CMAKE_CURRENT_SOURCE_DIR}/assets
-          $<TARGET_FILE_DIR:cpp-daemon>/assets)
+# 资源（图标 + 配置页）已全部内嵌进 exe，运行时不再依赖外部 assets 目录。
 
 # ---- reporter 插件（动态库）----
 add_subdirectory(src/plugins/reporter)

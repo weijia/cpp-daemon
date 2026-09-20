@@ -14,6 +14,7 @@ struct RemoteStorageConfig {
   std::string token;
   std::string scope;
   std::string pathTemplate;
+  std::string proxy;  // 可选，形如 http://host:port 或 host:port
 };
 
 struct ReportConfig {

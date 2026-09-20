@@ -5,3 +5,6 @@
 
 // 托盘图标：与 go-daemon 共用 appicon_tray.png，运行时由 GDI+ 解码为 HICON（见 Tray.cpp）
 IDR_TRAY_PNG RCDATA "assets\\appicon_tray.png"
+
+// 配置页（HTTP 服务返回），内嵌到 exe，运行时无需外部 assets 目录
+IDR_CONFIG_PAGE RCDATA "assets\\config_page.html"

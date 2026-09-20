@@ -19,8 +19,8 @@ set_target_properties(reporter PROPERTIES
   MSVC_RUNTIME_LIBRARY "MultiThreadedDLL"
 )
 
-# 输出到 <build>/plugins/，与宿主 exe 同目录
+# 输出到 exe 同级的 plugins/ 目录（<exedir>/plugins），与宿主加载路径一致
 set_target_properties(reporter PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/plugins
-  LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/plugins
+  RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:cpp-daemon>/plugins
+  LIBRARY_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:cpp-daemon>/plugins
 )
