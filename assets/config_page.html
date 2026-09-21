@@ -67,6 +67,7 @@
     <div id="pluginWrap"></div>
     <div class="actions">
       <button type="submit" class="btn-primary">保存并应用</button>
+      <button type="button" class="btn-ghost" id="refreshBtn">刷新配置</button>
       <button type="button" class="btn-ghost" id="updateBtn">立即上报</button>
     </div>
   </form>
@@ -97,8 +98,8 @@ function arrRead(cid, cols){
   }
   return out;
 }
-function arrRender(cid, cols, rows){
-  var host=document.getElementById('arrbody_'+cid); if(!host) return;
+function arrRender(cid, cols, rows, hostEl){
+  var host=hostEl||document.getElementById('arrbody_'+cid); if(!host) return;
   host.innerHTML='';
   rows.forEach(function(row,idx){
     var tr=document.createElement('tr');
@@ -186,7 +187,7 @@ function renderField(name,f,bucket){
     };
     wrap.appendChild(add);
     if(f.hint){ var h2=document.createElement('div'); h2.className='hint'; h2.textContent=f.hint; wrap.appendChild(h2); }
-    arrRender(cid,cols,rows);
+    arrRender(cid,cols,rows,bodyEl);  // 此时 tbody 尚未挂入文档，必须用元素引用直接渲染
     return wrap;
   }
   var id='f_'+name+'_'+f.key; var el;
@@ -258,6 +259,7 @@ $('updateBtn').addEventListener('click', function(){
   fetch('/api/update',{method:'POST'}).then(function(r){ return r.json(); }).then(function(d){ if(d.ok) toast('上报成功'); else toast('上报失败: '+(d.error||'')); loadStatus(); })
     .catch(function(e){ toast('上报失败: '+e.message); });
 });
+$('refreshBtn').addEventListener('click', function(){ load(); toast('已刷新配置'); });
 load();
 </script>
 </body>

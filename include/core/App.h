@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "core/Config.h"
@@ -92,6 +93,17 @@ private:
   bool httpRunning_ = false;
 
   std::atomic<bool> quitting_{false};
+
+  // 配置文件热加载：监听 config.json，检测到内容变化即重新应用（不回写文件，避免死循环）。
+  void startConfigWatch();
+  void stopConfigWatch();
+  // Windows 下用 ReadDirectoryChangesW 阻塞等待目录变更；非 Windows/失败时回退轮询。
+  void watchLoop();
+  // 读取 config.json，与上次基准比较，内容变化则重新应用。
+  void reloadIfChanged();
+  std::thread watchThread_;
+  std::atomic<bool> watchRunning_{false};
+  std::string lastRaw_;  // 上一次已应用的配置原文，用于判断文件是否真的变化
 };
 
 }  // namespace cppdaemon

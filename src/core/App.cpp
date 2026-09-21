@@ -4,8 +4,11 @@
 #include "core/Autostart.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <functional>
+#include <thread>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -96,6 +99,7 @@ bool App::init() {
     routeRegs_.push_back({pluginNameOf(routeId), route});
   };
   plugins_ = std::make_unique<PluginManager>(pluginsDirPath(), onTray, onRoute);
+  startConfigWatch();  // 启动配置文件热加载（轮询，不阻塞）
   return true;
 }
 
@@ -145,6 +149,13 @@ bool App::applyConfig(const Config& newCfg, std::string& err) {
   if (!saveConfig(cfgPath_, cfg_)) {
     err = "配置写盘失败";
     return false;
+  }
+  // 记录已落盘的配置原文，避免被热加载轮询误判为“外部修改”。
+  {
+    std::lock_guard<std::mutex> lk(cfgMu_);
+    nlohmann::json j;
+    toJson(cfg_, j);
+    lastRaw_ = j.dump();
   }
   applyAutostart();
   // 启用状态变化 → 热加载/热卸载；路由由 HTTP 层按插件名实时分发，故无需重启服务。
@@ -231,9 +242,106 @@ void App::forwardTrayClick(const std::string& itemId) {
 
 void App::quit() {
   if (quitting_.exchange(true)) return;
+  stopConfigWatch();
   if (plugins_) plugins_->shutdownAll();
   if (http_) http_->shutdown();
   if (tray_) tray_->quit();
+}
+
+void App::startConfigWatch() {
+  // 以当前内存配置作为基准，避免启动后立即触发一次“变更”。
+  {
+    std::lock_guard<std::mutex> lk(cfgMu_);
+    nlohmann::json j;
+    toJson(cfg_, j);
+    lastRaw_ = j.dump();
+  }
+  watchRunning_ = true;
+  watchThread_ = std::thread([this]() { watchLoop(); });
+}
+
+// 读取 config.json，与上次已应用的基准比较；若内容确实变化则重新应用（不回写文件，避免死循环）。
+void App::reloadIfChanged() {
+  Config nc;
+  if (!loadConfig(cfgPath_, nc)) return;  // 文件暂不存在/读取失败，下一轮再试
+  nlohmann::json j;
+  toJson(nc, j);
+  std::string raw = j.dump();
+  if (raw == lastRaw_) return;  // 内容无变化
+  std::string err;
+  if (!nc.validate(err)) {
+    std::fprintf(stderr, "[app] 配置文件已变更但校验失败，已忽略: %s\n", err.c_str());
+    lastRaw_ = raw;  // 记录以免反复报错
+    return;
+  }
+  if (!plugins_) {  // 插件管理器尚未就绪（极少情况），仅更新基准。
+    lastRaw_ = raw;
+    return;
+  }
+  // 外部修改：重新应用，但不回写文件（否则会陷入 mtime 死循环）。
+  std::string oldListen;
+  std::map<std::string, nlohmann::json> oldPlugins;
+  {
+    std::lock_guard<std::mutex> lk(cfgMu_);
+    oldListen = cfg_.http.listen;
+    oldPlugins = cfg_.plugins;
+    cfg_ = nc;
+    lastRaw_ = raw;
+  }
+  syncPlugins(oldPlugins, cfg_.plugins);
+  if (nc.http.listen != oldListen) restartHTTP();
+  plugins_->applyConfig(cfg_.plugins, identity_);
+  std::fprintf(stderr, "[app] 检测到配置文件变更，已热加载\n");
+}
+
+void App::watchLoop() {
+#ifdef _WIN32
+  // Windows：用目录变更通知（ReadDirectoryChangesW）等待 config.json 变化，事件驱动、无空转。
+  namespace fs = std::filesystem;
+  fs::path p(cfgPath_);
+  std::wstring dir = p.parent_path().wstring();
+  HANDLE hDir = CreateFileW(dir.c_str(), FILE_LIST_DIRECTORY,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING,
+                            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
+  if (hDir != INVALID_HANDLE_VALUE) {
+    char buf[8192];
+    OVERLAPPED ov{};
+    ov.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    while (watchRunning_.load()) {
+      DWORD bytes = 0;
+      ResetEvent(ov.hEvent);
+      if (!ReadDirectoryChangesW(hDir, buf, sizeof(buf), FALSE,
+                                 FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME,
+                                 &bytes, &ov, nullptr)) {
+        break;
+      }
+      // 500ms 超时以便退出时能及时唤醒（避免 quit 时 join 死锁）
+      DWORD r = WaitForSingleObject(ov.hEvent, 500);
+      if (r == WAIT_TIMEOUT) continue;
+      if (r != WAIT_OBJECT_0) break;
+      GetOverlappedResult(hDir, &ov, &bytes, FALSE);
+      // 写入可能尚未结束，稍作去抖后再读，避免读半截文件
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      if (watchRunning_.load()) reloadIfChanged();
+    }
+    if (ov.hEvent) CloseHandle(ov.hEvent);
+    CloseHandle(hDir);
+    return;
+  }
+  std::fprintf(stderr, "[app] 无法打开配置目录监听，回退为轮询\n");
+#endif
+  // 回退：定时轮询（兼容非 Windows 或目录句柄获取失败）
+  while (watchRunning_.load()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    if (!watchRunning_.load()) break;
+    reloadIfChanged();
+  }
+}
+
+void App::stopConfigWatch() {
+  watchRunning_ = false;
+  if (watchThread_.joinable()) watchThread_.join();
 }
 
 }  // namespace cppdaemon
