@@ -46,18 +46,19 @@ public:
   PluginManager& plugins() { return *plugins_; }
   std::string configPath() const { return cfgPath_; }
 
-  // 插件声明的路由（含插件指针），供 HTTP 转发。
+  // 插件声明的路由（存插件名而非指针）：转发时按名实时解析，
+  // 插件热卸载后不会留下悬空指针。
   struct PluginRoute {
+    std::string pluginName;
     Route route;
-    Plugin* plugin;
   };
   std::vector<PluginRoute> pluginRoutes() const {
     std::lock_guard<std::mutex> lk(routeMu_);
     return routeRegs_;
   }
 
-  // 插件声明的托盘项：itemId -> 插件指针，供点击转发。
-  const std::map<std::string, Plugin*>& trayPlugins() const { return trayPlugins_; }
+  // 插件声明的托盘项：itemId -> 插件名，供点击转发。
+  const std::map<std::string, std::string>& trayPlugins() const { return trayPlugins_; }
 
   // 托盘点击转发到对应插件。
   void forwardTrayClick(const std::string& itemId);
@@ -66,6 +67,12 @@ private:
   void applyAutostart();
   void restartHTTP();
   void listenHTTP();
+
+  // 依据新旧配置桶的 enabled 差异，热加载/热卸载插件；返回插件集合是否变化。
+  bool syncPlugins(const std::map<std::string, nlohmann::json>& oldP,
+                   const std::map<std::string, nlohmann::json>& newP);
+  // 清理某插件遗留的路由与托盘注册（卸载后调用）。
+  void dropPluginRegs(const std::string& name);
 
   std::string cfgPath_;
   mutable std::mutex cfgMu_;
@@ -78,7 +85,7 @@ private:
 
   mutable std::mutex routeMu_;
   std::vector<PluginRoute> routeRegs_;
-  std::map<std::string, Plugin*> trayPlugins_;
+  std::map<std::string, std::string> trayPlugins_;
 
   std::mutex httpMu_;
   std::string httpAddr_;

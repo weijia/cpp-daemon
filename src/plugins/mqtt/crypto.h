@@ -2,7 +2,7 @@
 
 #include <string>
 
-namespace reporter {
+namespace daemoncrypto {
 
 // 与 go-daemon（CryptoJS/OpenSSL）兼容的 AES-256-CBC 加解密。
 // 密文格式：base64("Salted__" + 8字节salt + AES-CBC密文)，PKCS7 填充，

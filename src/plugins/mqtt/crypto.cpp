@@ -7,7 +7,7 @@
 #include <cstring>
 #include <string>
 
-namespace reporter {
+namespace daemoncrypto {
 
 namespace {
 

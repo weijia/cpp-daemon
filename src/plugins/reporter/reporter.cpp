@@ -1,4 +1,5 @@
-// reporter 插件：RemoteStorage 上报 + MQTT 远程命令（实现 cppdaemon::Plugin）。
+// reporter 插件：RemoteStorage 上报（实现 cppdaemon::Plugin）。
+// MQTT 远程命令已拆分为独立的 mqtt 插件；本插件仅负责节点状态上报与 inbox 命令。
 #include "core/Plugin.h"
 #include "core/Config.h"
 
@@ -18,29 +19,14 @@
 #include <openssl/ssl.h>
 #endif
 
-#include <mqtt/async_client.h>
-
 #ifdef _WIN32
 #include <windows.h>
 #include <iphlpapi.h>
-#define RUN_POPEN _popen
-#define RUN_PCLOSE _pclose
-#else
-#define RUN_POPEN popen
-#define RUN_PCLOSE pclose
 #endif
-
-#include "crypto.h"
 
 // 插件自包含：复刻宿主 Config.cpp 的配置解析与 URL 工具。
 // 依据 Plugin.h 约定，宿主与插件互不 link，故插件需自带这些小工具。
 namespace cppdaemon {
-
-void toJson(const MQTTConfig& c, nlohmann::json& j) {
-  j = {{"enabled", c.enabled},   {"broker", c.broker},   {"topic", c.topic},
-       {"username", c.username}, {"password", c.password},
-       {"secret", c.secret},     {"client_id", c.clientId}};
-}
 
 ReporterConfig reporterFromJson(const nlohmann::json& j) {
   ReporterConfig c;
@@ -56,16 +42,6 @@ ReporterConfig reporterFromJson(const nlohmann::json& j) {
     auto& rp = j["report"];
     c.report.intervalMinutes = rp.value("interval_minutes", 15);
     c.report.extraInfo = rp.value("extra_info", true);
-  }
-  if (j.contains("mqtt")) {
-    auto& mq = j["mqtt"];
-    c.mqtt.enabled = mq.value("enabled", false);
-    c.mqtt.broker = mq.value("broker", "");
-    c.mqtt.topic = mq.value("topic", "ufsd/cmd");
-    c.mqtt.username = mq.value("username", "");
-    c.mqtt.password = mq.value("password", "");
-    c.mqtt.secret = mq.value("secret", "");
-    c.mqtt.clientId = mq.value("client_id", "");
   }
   return c;
 }
@@ -105,7 +81,22 @@ std::string nowISO() {
   return std::string(buf);
 }
 
-constexpr const char* kDefaultTopic = "ufsd/cmd";
+// 由 mqtt 插件的配置桶生成上报给服务端的 mqtt 字段。
+// 服务端据此知道往哪个 topic、用哪个 secret 下发命令（沿用旧版 payload 结构）。
+// mqtt 配置已迁出 reporter，这里通过 AppConfig::allPlugins 跨插件读取，避免重复配置。
+nlohmann::json mqttPayloadFrom(const std::map<std::string, nlohmann::json>& all) {
+  nlohmann::json out = nlohmann::json::object();
+  auto it = all.find("mqtt");
+  if (it != all.end() && it->second.is_object()) out = it->second;
+  if (!out.contains("enabled")) out["enabled"] = false;
+  if (!out.contains("broker")) out["broker"] = "";
+  if (!out.contains("topic")) out["topic"] = "ufsd/cmd";
+  if (!out.contains("username")) out["username"] = "";
+  if (!out.contains("password")) out["password"] = "";
+  if (!out.contains("secret")) out["secret"] = "";
+  if (!out.contains("client_id")) out["client_id"] = "";
+  return out;
+}
 
 // 上传错误分类
 struct UploadError {
@@ -224,7 +215,7 @@ struct NodePayload {
   std::vector<std::string> internalIPs;
   std::vector<Capability> capabilities;
   std::vector<Command> inbox;
-  cppdaemon::MQTTConfig mqtt;
+  nlohmann::json mqtt;  // 来自 mqtt 插件桶（跨插件只读）
 };
 
 // nlohmann JSON 适配（ADL，命名空间与结构体一致）
@@ -244,13 +235,11 @@ inline void from_json(const nlohmann::json& j, Command& c) {
   c.result = j.value("result", nlohmann::json::object());
 }
 inline void to_json(nlohmann::json& j, const NodePayload& p) {
-  nlohmann::json mj;
-  cppdaemon::toJson(p.mqtt, mj);
   j = {{"uuid", p.uuid}, {"name", p.name}, {"status", p.status},
        {"last_access", p.lastAccess}, {"hostname", p.hostname}, {"os", p.os},
        {"version", p.version}, {"external_ip", p.externalIP},
        {"internal_ips", p.internalIPs}, {"capabilities", p.capabilities},
-       {"inbox", p.inbox}, {"mqtt", mj}};
+       {"inbox", p.inbox}, {"mqtt", p.mqtt}};
 }
 
 class Reporter : public cppdaemon::Plugin {
@@ -265,11 +254,13 @@ public:
       if (!cfg.pluginConfig.is_null()) cfg_ = cppdaemon::reporterFromJson(cfg.pluginConfig);
       else cfg_ = cppdaemon::ReporterConfig{};
     }
+    {
+      std::lock_guard<std::mutex> lk(allMu_);
+      allPlugins_ = cfg.allPlugins;
+    }
     client_.reset();
     quit_ = false;
-    mqttQuit_ = false;
     reportThread_ = std::thread([this]() { reportLoop(); });
-    mqttThread_ = std::thread([this]() { syncMQTT(); });
     return true;
   }
 
@@ -279,36 +270,23 @@ public:
       if (!cfg.pluginConfig.is_null()) cfg_ = cppdaemon::reporterFromJson(cfg.pluginConfig);
     }
     {
+      std::lock_guard<std::mutex> lk(allMu_);
+      allPlugins_ = cfg.allPlugins;
+    }
+    {
       std::unique_lock<std::mutex> lk(cvMu_);
       cv_.notify_all();
     }
-    // 干净地重启 MQTT 线程（旧线程退出后再起新线程，避免双客户端竞态）
-    {
-      std::lock_guard<std::mutex> lk(mqttMu_);
-      mqttQuit_ = true;
-    }
-    if (mqttThread_.joinable()) mqttThread_.join();
-    {
-      std::lock_guard<std::mutex> lk(mqttMu_);
-      mqttQuit_ = false;
-    }
-    mqttThread_ = std::thread([this]() { syncMQTT(); });
     return true;
   }
 
   void shutdown() override {
     quit_ = true;
-    mqttQuit_ = true;
     {
       std::unique_lock<std::mutex> lk(cvMu_);
       cv_.notify_all();
     }
     if (reportThread_.joinable()) reportThread_.join();
-    if (mqttThread_.joinable()) mqttThread_.join();
-    if (mqttCli_) {
-      try { mqttCli_->disconnect()->wait(); } catch (...) {}
-      mqttCli_.reset();
-    }
   }
 
   cppdaemon::DesiredUI desiredUI() const override {
@@ -331,13 +309,6 @@ public:
         {"remotestorage.proxy", "代理 Proxy（可选）", "text", "公司网络需填写，如 http://proxy:8080；留空则自动读取系统代理环境变量"},
         {"report.interval_minutes", "上报间隔（分钟）", "number"},
         {"report.extra_info", "附带本机基础信息", "bool"},
-        {"mqtt.enabled", "启用 MQTT", "bool"},
-        {"mqtt.broker", "Broker 地址", "text"},
-        {"mqtt.topic", "订阅主题 Topic", "text"},
-        {"mqtt.username", "Broker 用户名", "text"},
-        {"mqtt.password", "Broker 密码", "password"},
-        {"mqtt.secret", "AES 解密密钥", "password"},
-        {"mqtt.client_id", "ClientID", "text"},
     };
     return s;
   }
@@ -374,9 +345,10 @@ private:
   std::mutex cvMu_;
   std::condition_variable cv_;
   std::thread reportThread_;
-  std::thread mqttThread_;
-  std::mutex mqttMu_;
-  bool mqttQuit_ = false;
+
+  // 跨插件只读配置视图（AppConfig::allPlugins）
+  std::mutex allMu_;
+  std::map<std::string, nlohmann::json> allPlugins_;
 
   // 上报状态
   std::mutex stateMu_;
@@ -388,6 +360,11 @@ private:
   std::string targetURL() {
     std::lock_guard<std::mutex> lk(mu_);
     return cppdaemon::resolveURL(cfg_.remotestorage, identity_.uuid);
+  }
+
+  std::map<std::string, nlohmann::json> allPluginsSnapshot() {
+    std::lock_guard<std::mutex> lk(allMu_);
+    return allPlugins_;
   }
 
   int intervalMin() {
@@ -579,7 +556,7 @@ private:
       p.externalIP = externalIP();
     }
     p.capabilities = localCapabilities();
-    if (c.mqtt.enabled) p.mqtt = c.mqtt;
+    p.mqtt = mqttPayloadFrom(allPluginsSnapshot());
     return p;
   }
 
@@ -670,123 +647,6 @@ private:
 #endif
   }
 
-  // ---------- MQTT ----------
-  std::unique_ptr<mqtt::async_client> mqttCli_;
-
-  void syncMQTT() {
-    cppdaemon::ReporterConfig c;
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      c = cfg_;
-    }
-    if (mqttCli_) {
-      try { mqttCli_->disconnect()->wait(); } catch (...) {}
-      mqttCli_.reset();
-    }
-    if (!c.mqtt.enabled || c.mqtt.broker.empty()) {
-      rlog("[reporter] MQTT 未启用或未配置 Broker\n");
-      return;
-    }
-    std::string topic = c.mqtt.topic.empty() ? kDefaultTopic : c.mqtt.topic;
-    std::string cid = c.mqtt.clientId.empty()
-                          ? ("ufsd-" + (identity_.uuid.size() > 8 ? identity_.uuid.substr(0, 8) : identity_.uuid))
-                          : c.mqtt.clientId;
-
-    try {
-      auto cli = std::make_unique<mqtt::async_client>(c.mqtt.broker, cid);
-      auto secret = c.mqtt.secret;
-      auto broker = c.mqtt.broker;
-      auto t = topic;
-      auto self = this;
-      struct Cb : public mqtt::callback {
-        Reporter* r;
-        std::string secret, topic;
-        Cb(Reporter* r, const std::string& s, const std::string& tp)
-            : r(r), secret(s), topic(tp) {}
-        void connected(const std::string&) override {
-          try {
-            r->mqttCli_->subscribe(topic, 1)->wait();
-            rlog("[reporter] MQTT 已订阅 %s\n", topic.c_str());
-          } catch (const std::exception& e) {
-            rlog("[reporter] MQTT 订阅失败: %s\n", e.what());
-          }
-        }
-        void connection_lost(const std::string& cause) override {
-          rlog("[reporter] MQTT 连接丢失: %s\n", cause.c_str());
-        }
-        void message_arrived(mqtt::const_message_ptr m) override {
-          std::string plain;
-          if (!reporter::decryptAES(secret, m->to_string(), plain)) {
-            rlog("[reporter] MQTT 解密失败\n");
-            return;
-          }
-          r->handleMQTT(plain);
-        }
-      };
-      Cb cb(this, secret, topic);
-      cli->set_callback(cb);
-      mqtt::connect_options conn;
-      conn.set_clean_session(true);
-      if (!c.mqtt.username.empty()) {
-        conn.set_user_name(c.mqtt.username);
-        conn.set_password(c.mqtt.password);
-      }
-      mqttCli_ = std::move(cli);
-      mqttCli_->connect(conn)->wait();
-      // 阻塞直到退出
-      while (!mqttQuit_ && !quit_) {
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-      }
-      try { mqttCli_->disconnect()->wait(); } catch (...) {}
-      mqttCli_.reset();
-    } catch (const std::exception& e) {
-      rlog("[reporter] MQTT 初始化失败: %s\n", e.what());
-    }
-  }
-
-  void handleMQTT(const std::string& plain) {
-    nlohmann::json src = nlohmann::json::parse(plain, nullptr, false);
-    std::string cmd = src.value("msg", std::string());
-    if (cmd.empty()) return;
-    std::string out;
-    bool ok = true;
-    std::string e;
-    if (mqttCli_) {
-      // 执行命令（cmd /C 或 sh -c），5 分钟超时
-      std::string shell = cmd;
-#ifdef _WIN32
-      shell = "cmd /C " + cmd;
-#else
-      shell = "sh -c " + cmd;
-#endif
-      FILE* pipe = RUN_POPEN(shell.c_str(), "r");
-      if (pipe) {
-        char buf[512];
-        while (fgets(buf, sizeof(buf), pipe)) out += buf;
-        int code = RUN_PCLOSE(pipe);
-        ok = (code == 0);
-        if (!ok) e = "exit code " + std::to_string(code);
-      } else {
-        ok = false;
-        e = "无法启动命令";
-      }
-    }
-    if (!mqttCli_) return;
-    // 加密回执到 topic+"/reply"
-    nlohmann::json rep = {{"id", src.value("id", "")},
-                          {"msgId", src.value("msgId", "")},
-                          {"user", src.value("user", "")},
-                          {"ok", ok},
-                          {"output", out},
-                          {"error", e},
-                          {"time", (int64_t)std::time(nullptr) * 1000}};
-    std::string cipher = reporter::encryptAES(cfg_.mqtt.secret, rep.dump());
-    try {
-      mqttCli_->publish(mqtt::make_message(cfg_.mqtt.topic + "/reply", cipher, 1, false));
-    } catch (const std::exception& ex) {
-      rlog("[reporter] MQTT 回执失败: %s\n", ex.what());
-    }
-  }
 };
 
 }  // namespace reporter

@@ -1,6 +1,7 @@
 #include "core/HttpServer.h"
 #include "core/App.h"
 
+#include <cctype>
 #include <fstream>
 #include <sstream>
 #include <thread>
@@ -129,13 +130,9 @@ public:
     server_.Get("/api/config", [this](const httplib::Request&, httplib::Response& res) {
       nlohmann::json out;
       out["config"] = configToJson(app_->config());
-      nlohmann::json schemas = nlohmann::json::object();
-      for (auto& kv : app_->plugins().schemas()) {
-        nlohmann::json sj;
-        toJson(kv.second, sj);
-        schemas[kv.first] = sj;
-      }
-      out["schemas"] = schemas;
+      out["schemas"] = schemasJson();
+      out["available_plugins"] = availableJson();
+      out["loaded_plugins"] = loadedJson();
       res.set_header("Content-Type", "application/json; charset=utf-8");
       res.set_content(out.dump(), "application/json");
     });
@@ -160,15 +157,18 @@ public:
         res.set_content(std::string("{\"error\":\"") + err + "\"}", "application/json");
         return;
       }
+      // 插件可能被热加载/热卸载，回传最新 schema 与可用插件列表，便于页面即时重绘。
       nlohmann::json out = {{"ok", true}, {"config", configToJson(app_->config())}};
+      out["schemas"] = schemasJson();
+      out["available_plugins"] = availableJson();
+      out["loaded_plugins"] = loadedJson();
       res.set_content(out.dump(), "application/json");
     });
 
-    // 插件动态路由
-    auto schemas = app_->plugins().schemas();  // 仅用于校验存在；路由已注册在 manager
-    (void)schemas;
-    // 逐个插件注册其声明的路由
-    registerPluginRoutes();
+    // 插件路由：httplib 的路由表是运行期无保护的 vector，增删不安全；
+    // 而插件需要支持热加载/热卸载，故启动时只注册一次通配入口，
+    // 真正的分发在请求时按插件名实时解析（插件已卸载 → 404，不会碰到已析构对象）。
+    registerPluginDispatchers();
 
     thread_ = std::thread([this]() {
       // addr_ 形如 host:port，httplib 的 listen 需拆开
@@ -180,46 +180,89 @@ public:
     });
   }
 
-  void registerPluginRoutes() {
-    // 宿主需知道每个插件的路由与插件指针：通过 App 暴露
-    // 这里简单地遍历所有已声明路由（App 在 LoadAll 时已收集到 manager 的注册回调，
-    // 但路由转发需要 plugin 指针）。改为从 App 取得：(routeId,route,plugin)。
-    for (auto& rr : app_->pluginRoutes()) {
-      const Route route = rr.route;
-      Plugin* plugin = rr.plugin;
-      const std::string path = route.path;
-      auto handler = [this, plugin, path](const httplib::Request& req, httplib::Response& res) {
-        Request r;
-        r.method = req.method;
-        r.path = req.path;
-        for (auto& h : req.headers) r.header[h.first] = h.second;
-        r.body = req.body;
-        Response resp;
-        try {
-          resp = plugin->handle(path, r);
-        } catch (const std::exception& e) {
-          res.status = 500;
-          res.set_content(std::string("{\"error\":\"") + e.what() + "\"}", "application/json");
-          return;
-        } catch (...) {
-          res.status = 500;
-          res.set_content(R"({"error":"插件处理未知异常"})", "application/json");
-          return;
-        }
-        for (auto& h : resp.header) res.set_header(h.first, h.second);
-        res.status = resp.statusCode;
-        std::string ctype = "application/octet-stream";
-        auto ct = resp.header.find("Content-Type");
-        if (ct != resp.header.end()) ctype = ct->second;
-        res.set_content(resp.body, ctype);
-      };
-      if (route.method == "GET" || route.method == "get")
-        server_.Get(path, handler);
-      else if (route.method == "POST" || route.method == "post")
-        server_.Post(path, handler);
-      else
-        server_.Get(path, handler);
+  static bool sameMethod(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+      if (std::toupper(static_cast<unsigned char>(a[i])) !=
+          std::toupper(static_cast<unsigned char>(b[i])))
+        return false;
     }
+    return true;
+  }
+
+  // 插件路由只注册一次通配入口（httplib 按注册顺序首个命中即返回，
+  // 内置的 "/"、"/api/config" 先注册，因此优先命中）。
+  void registerPluginDispatchers() {
+    auto dispatcher = [this](const httplib::Request& req, httplib::Response& res) {
+      handlePluginRoute(req, res);
+    };
+    server_.Get(".*", dispatcher);
+    server_.Post(".*", dispatcher);
+    server_.Put(".*", dispatcher);
+    server_.Delete(".*", dispatcher);
+  }
+
+  void handlePluginRoute(const httplib::Request& req, httplib::Response& res) {
+    Plugin* plugin = nullptr;
+    std::string path;
+    for (auto& rr : app_->pluginRoutes()) {
+      if (rr.route.path != req.path) continue;
+      if (!sameMethod(rr.route.method, req.method)) continue;
+      plugin = app_->plugins().get(rr.pluginName);  // 热卸载后为 nullptr
+      path = rr.route.path;
+      break;
+    }
+    if (!plugin) {
+      res.status = 404;
+      res.set_content(R"({"error":"插件未加载或该路由不存在"})", "application/json");
+      return;
+    }
+    Request r;
+    r.method = req.method;
+    r.path = req.path;
+    for (auto& h : req.headers) r.header[h.first] = h.second;
+    r.body = req.body;
+    Response resp;
+    try {
+      resp = plugin->handle(path, r);
+    } catch (const std::exception& e) {
+      res.status = 500;
+      res.set_content(std::string("{\"error\":\"") + e.what() + "\"}", "application/json");
+      return;
+    } catch (...) {
+      res.status = 500;
+      res.set_content(R"({"error":"插件处理未知异常"})", "application/json");
+      return;
+    }
+    for (auto& h : resp.header) res.set_header(h.first, h.second);
+    res.status = resp.statusCode;
+    std::string ctype = "application/octet-stream";
+    auto ct = resp.header.find("Content-Type");
+    if (ct != resp.header.end()) ctype = ct->second;
+    res.set_content(resp.body, ctype);
+  }
+
+  // 含未加载插件（仅探测 schema，不运行），保证配置页总能展示完整选项
+  nlohmann::json schemasJson() {
+    nlohmann::json schemas = nlohmann::json::object();
+    for (auto& kv : app_->plugins().allSchemas()) {
+      nlohmann::json sj;
+      toJson(kv.second, sj);
+      schemas[kv.first] = sj;
+    }
+    return schemas;
+  }
+
+  nlohmann::json availableJson() {
+    nlohmann::json avail = nlohmann::json::array();
+    for (auto& n : app_->plugins().availablePlugins()) avail.push_back(n);
+    return avail;
+  }
+
+  nlohmann::json loadedJson() {
+    nlohmann::json arr = nlohmann::json::array();
+    for (auto& n : app_->plugins().loadedPlugins()) arr.push_back(n);
+    return arr;
   }
 
   void shutdown() {

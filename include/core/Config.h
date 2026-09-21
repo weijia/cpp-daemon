@@ -22,20 +22,9 @@ struct ReportConfig {
   bool extraInfo = true;
 };
 
-struct MQTTConfig {
-  bool enabled = false;
-  std::string broker;
-  std::string topic;
-  std::string username;
-  std::string password;
-  std::string secret;
-  std::string clientId;
-};
-
 struct ReporterConfig {
   RemoteStorageConfig remotestorage;
   ReportConfig report;
-  MQTTConfig mqtt;
 };
 
 struct HTTPConfig {
@@ -76,7 +65,6 @@ ReporterConfig reporterFromJson(const nlohmann::json& j);
 // 各子配置序列化（reporter 插件复用）。
 void toJson(const RemoteStorageConfig& c, nlohmann::json& j);
 void toJson(const ReportConfig& c, nlohmann::json& j);
-void toJson(const MQTTConfig& c, nlohmann::json& j);
 
 // 计算 PUT 目标 URL（替换 {user}/{uuid}）。
 std::string resolveURL(const RemoteStorageConfig& rs, const std::string& uuid);

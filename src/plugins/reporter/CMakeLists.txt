@@ -1,5 +1,5 @@
 # reporter 插件：产出 reporter.dll / libreporter.so
-add_library(reporter SHARED reporter.cpp crypto.cpp)
+add_library(reporter SHARED reporter.cpp)
 
 target_include_directories(reporter PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../../include
@@ -9,7 +9,6 @@ target_link_libraries(reporter PRIVATE
   OpenSSL::SSL OpenSSL::Crypto
   nlohmann_json::nlohmann_json
   httplib::httplib
-  PahoMqttCpp::paho-mqttpp3-static
   $<$<PLATFORM_ID:Windows>:iphlpapi>
 )
 

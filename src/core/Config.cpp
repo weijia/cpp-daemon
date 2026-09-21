@@ -54,12 +54,18 @@ Config defaultConfig() {
   rc.remotestorage.pathTemplate = "/ufs-nodes/{uuid}.json";
   rc.report.intervalMinutes = 15;
   rc.report.extraInfo = true;
-  rc.mqtt.enabled = false;
-  rc.mqtt.topic = "ufsd/cmd";
-
   nlohmann::json bucket;
   toJson(rc, bucket);
+  bucket["enabled"] = true;  // 插件加载开关（宿主读取，缺省 true）
   c.plugins["reporter"] = bucket;
+
+  // 其余插件给出默认桶，便于在配置页直接开关与编辑。
+  // mqtt 默认关闭（未配 broker，避免无谓连接）；scheduler 默认启用但任务为空。
+  c.plugins["mqtt"] = {{"enabled", false},  {"broker", ""},
+                       {"topic", "ufsd/cmd"}, {"username", ""},
+                       {"password", ""},   {"secret", ""},
+                       {"client_id", ""}};
+  c.plugins["scheduler"] = {{"enabled", true}, {"tasks", nlohmann::json::array()}};
   return c;
 }
 
@@ -72,17 +78,11 @@ void toJson(const RemoteStorageConfig& c, nlohmann::json& j) {
 void toJson(const ReportConfig& c, nlohmann::json& j) {
   j = {{"interval_minutes", c.intervalMinutes}, {"extra_info", c.extraInfo}};
 }
-void toJson(const MQTTConfig& c, nlohmann::json& j) {
-  j = {{"enabled", c.enabled},   {"broker", c.broker},   {"topic", c.topic},
-       {"username", c.username}, {"password", c.password},
-       {"secret", c.secret},     {"client_id", c.clientId}};
-}
 void toJson(const ReporterConfig& c, nlohmann::json& j) {
-  nlohmann::json rs, rp, mq;
+  nlohmann::json rs, rp;
   toJson(c.remotestorage, rs);
   toJson(c.report, rp);
-  toJson(c.mqtt, mq);
-  j = {{"remotestorage", rs}, {"report", rp}, {"mqtt", mq}};
+  j = {{"remotestorage", rs}, {"report", rp}};
 }
 
 ReporterConfig reporterFromJson(const nlohmann::json& j) {
@@ -100,16 +100,6 @@ ReporterConfig reporterFromJson(const nlohmann::json& j) {
     auto& rp = j["report"];
     c.report.intervalMinutes = rp.value("interval_minutes", 15);
     c.report.extraInfo = rp.value("extra_info", true);
-  }
-  if (j.contains("mqtt")) {
-    auto& mq = j["mqtt"];
-    c.mqtt.enabled = mq.value("enabled", false);
-    c.mqtt.broker = mq.value("broker", "");
-    c.mqtt.topic = mq.value("topic", "ufsd/cmd");
-    c.mqtt.username = mq.value("username", "");
-    c.mqtt.password = mq.value("password", "");
-    c.mqtt.secret = mq.value("secret", "");
-    c.mqtt.clientId = mq.value("client_id", "");
   }
   return c;
 }
@@ -242,62 +232,52 @@ Config ensureConfig(const std::string& path) {
   if (c.http.listen.empty()) c.http.listen = "127.0.0.1:9801";
   if (c.plugins.empty()) c.plugins["reporter"] = nlohmann::json::object();
 
-  // 旧版顶层 remotestorage/report/mqtt 迁移进 plugins.reporter
-  if (!c.plugins.count("reporter")) {
-    nlohmann::json legacy;
-    // 旧字段可能直接挂在顶层（这里仅当明确存在时迁移）
-    bool hasLegacy = false;
-    RemoteStorageConfig rs;
-    ReportConfig rp;
-    MQTTConfig mq;
-    // 通过重新读取原始文件判断是否含旧顶层字段
-    {
-      std::ifstream f(path, std::ios::binary);
-      if (f) {
-        nlohmann::json raw;
-        try {
-          f >> raw;
-          if (raw.contains("remotestorage")) {
-            auto& o = raw["remotestorage"];
-            rs.server = o.value("server", "");
-            rs.user = o.value("user", "");
-            rs.token = o.value("token", "");
-            rs.scope = o.value("scope", "");
-            rs.pathTemplate = o.value("path_template", "");
-            hasLegacy = true;
-          }
-          if (raw.contains("report")) {
-            auto& o = raw["report"];
-            rp.intervalMinutes = o.value("interval_minutes", 0);
-            rp.extraInfo = o.value("extra_info", false);
-            hasLegacy = true;
-          }
-          if (raw.contains("mqtt")) {
-            auto& o = raw["mqtt"];
-            mq.enabled = o.value("enabled", false);
-            mq.broker = o.value("broker", "");
-            mq.topic = o.value("topic", "ufsd/cmd");
-            mq.username = o.value("username", "");
-            mq.password = o.value("password", "");
-            mq.secret = o.value("secret", "");
-            mq.clientId = o.value("client_id", "");
-            hasLegacy = true;
-          }
-        } catch (...) {
-        }
+  // 旧版顶层字段迁移：remotestorage/report → reporter 桶；mqtt → mqtt 插件桶
+  nlohmann::json raw = nlohmann::json::object();
+  {
+    std::ifstream f(path, std::ios::binary);
+    if (f) {
+      try {
+        f >> raw;
+      } catch (...) {
+        raw = nlohmann::json::object();
       }
     }
-    if (hasLegacy) {
-      if (rp.intervalMinutes == 0) rp.intervalMinutes = 15;
-      ReporterConfig rc;
-      rc.remotestorage = rs;
-      rc.report = rp;
-      rc.mqtt = mq;
-      nlohmann::json bucket;
-      toJson(rc, bucket);
-      c.plugins["reporter"] = bucket;
-    }
   }
+  if (!c.plugins.count("reporter") &&
+      (raw.contains("remotestorage") || raw.contains("report"))) {
+    RemoteStorageConfig rs;
+    ReportConfig rp;
+    if (raw.contains("remotestorage")) {
+      auto& o = raw["remotestorage"];
+      rs.server = o.value("server", "");
+      rs.user = o.value("user", "");
+      rs.token = o.value("token", "");
+      rs.scope = o.value("scope", "");
+      rs.pathTemplate = o.value("path_template", "");
+    }
+    if (raw.contains("report")) {
+      auto& o = raw["report"];
+      rp.intervalMinutes = o.value("interval_minutes", 0);
+      rp.extraInfo = o.value("extra_info", false);
+    }
+    if (rp.intervalMinutes == 0) rp.intervalMinutes = 15;
+    ReporterConfig rc;
+    rc.remotestorage = rs;
+    rc.report = rp;
+    nlohmann::json bucket;
+    toJson(rc, bucket);
+    bucket["enabled"] = true;
+    c.plugins["reporter"] = bucket;
+  }
+  if (!c.plugins.count("mqtt")) {
+    if (raw.contains("mqtt"))
+      c.plugins["mqtt"] = raw["mqtt"];  // 旧版顶层 mqtt 整体迁入新插件桶
+    else
+      c.plugins["mqtt"] = {{"enabled", false}, {"topic", "ufsd/cmd"}};
+  }
+  if (!c.plugins.count("scheduler"))
+    c.plugins["scheduler"] = {{"enabled", true}, {"tasks", nlohmann::json::array()}};
   return c;
 }
 

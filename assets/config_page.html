@@ -23,6 +23,7 @@
   input:disabled{background:#F3F4F6;color:#9CA3AF}
   .checkbox{display:flex;align-items:center;gap:8px;margin-top:14px;font-size:14px}
   .checkbox input{width:16px;height:16px;accent-color:var(--primary)}
+  .plug-state{margin-left:auto;font-size:12px;font-weight:600}
   .actions{display:flex;gap:12px;margin-top:22px;flex-wrap:wrap}
   button{cursor:pointer;border:none;border-radius:11px;padding:12px 20px;font-size:14px;font-weight:600;font-family:inherit}
   .btn-primary{background:linear-gradient(135deg,var(--primary),var(--primary-d));color:#fff;box-shadow:0 8px 18px rgba(37,99,235,.28)}
@@ -30,6 +31,14 @@
   .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%) translateY(20px);background:#111827;color:#fff;padding:12px 20px;border-radius:12px;font-size:14px;opacity:0;pointer-events:none;transition:.25s;max-width:90vw}
   .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
   .hint{font-size:12px;color:var(--muted);margin-top:6px;line-height:1.5}
+  table.array{width:100%;border-collapse:collapse;margin-top:8px;font-size:13px}
+  table.array th{text-align:left;font-weight:600;color:var(--muted);font-size:12px;padding:6px 8px;border-bottom:1px solid #E5E7EB}
+  table.array td{padding:4px 6px;border-bottom:1px solid #F3F4F6}
+  table.array input{width:100%;padding:6px 8px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;background:#FCFCFD}
+  table.array input:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.15)}
+  table.array input[type=checkbox]{width:16px;height:16px}
+  .btn-mini{cursor:pointer;border:none;background:#FEE2E2;color:#B91C1C;border-radius:8px;padding:6px 10px;font-size:12px;font-weight:600;font-family:inherit}
+  .btn-add{margin-top:10px;padding:8px 14px;font-size:13px}
   footer{text-align:center;color:var(--muted);font-size:12px;margin-top:22px}
 </style>
 </head>
@@ -67,21 +76,119 @@
 <script>
 var $ = function(id){ return document.getElementById(id); };
 var schemas = {};
+var available = [];   // 磁盘上发现的所有插件（含已禁用的）
+var loaded = [];      // 当前已加载并运行的插件名
+var curCfg = {};      // 当前配置，保存时用于保留未渲染字段的原值
 function toast(msg){ var t=$('toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(t._t); t._t=setTimeout(function(){ t.classList.remove('show'); },2600); }
 function getNested(o, path){ var parts=path.split('.'); var cur=o; for(var i=0;i<parts.length;i++){ if(cur==null) return ''; cur=cur[parts[i]]; } return cur; }
 function setNested(o, path, val){ var parts=path.split('.'); var cur=o; for(var i=0;i<parts.length-1;i++){ var k=parts[i]; if(typeof cur[k]!=='object'||cur[k]==null) cur[k]={}; cur=cur[k]; } cur[parts[parts.length-1]]=val; }
+// 可用插件（磁盘上存在）与已加载插件（有 schema）的并集，保证禁用的也能显示开关
+var arrays={};   // 数组字段列定义缓存：containerId -> columns
+function arrRead(cid, cols){
+  var host=document.getElementById('arrbody_'+cid); if(!host) return [];
+  var out=[], rows=host.querySelectorAll('tr');
+  for(var i=0;i<rows.length;i++){
+    var obj={}, ins=rows[i].querySelectorAll('[data-col]');
+    for(var k=0;k<ins.length;k++){
+      var el=ins[k], c=el.getAttribute('data-col'), ty=el.getAttribute('data-type');
+      obj[c]=(ty==='bool')?el.checked:(ty==='number'?(parseInt(el.value,10)||0):el.value);
+    }
+    out.push(obj);
+  }
+  return out;
+}
+function arrRender(cid, cols, rows){
+  var host=document.getElementById('arrbody_'+cid); if(!host) return;
+  host.innerHTML='';
+  rows.forEach(function(row,idx){
+    var tr=document.createElement('tr');
+    cols.forEach(function(c){
+      var td=document.createElement('td'), el;
+      if(c.type==='bool'){ el=document.createElement('input'); el.type='checkbox'; el.checked=!!row[c.key]; }
+      else if(c.type==='number'){ el=document.createElement('input'); el.type='number'; el.value=(row[c.key]==null?'':row[c.key]); }
+      else { el=document.createElement('input'); el.type='text'; el.value=(row[c.key]==null?'':row[c.key]); }
+      el.setAttribute('data-col',c.key); el.setAttribute('data-type',c.type);
+      td.appendChild(el); tr.appendChild(td);
+    });
+    var td2=document.createElement('td'), del=document.createElement('button');
+    del.type='button'; del.className='btn-mini'; del.textContent='删除';
+    del.onclick=function(){ var r=arrRead(cid,cols); r.splice(idx,1); arrRender(cid,cols,r); };
+    td2.appendChild(del); tr.appendChild(td2);
+    host.appendChild(tr);
+  });
+}
+function pluginNames(sc){
+  var seen={}, out=[];
+  (available||[]).forEach(function(n){ if(!seen[n]){ seen[n]=1; out.push(n); } });
+  Object.keys(sc||{}).forEach(function(n){ if(!seen[n]){ seen[n]=1; out.push(n); } });
+  return out;
+}
 function renderPlugins(sc, config){
   var wrap=$('pluginWrap'); wrap.innerHTML='';
-  Object.keys(sc).forEach(function(name){
-    var s=sc[name]; var card=document.createElement('div'); card.className='card';
-    var h=document.createElement('h2'); h.textContent=s.title; card.appendChild(h);
+  pluginNames(sc).forEach(function(name){
+    var s=sc[name];
+    var card=document.createElement('div'); card.className='card';
+    var h=document.createElement('h2'); h.textContent=(s&&s.title)?s.title:name; card.appendChild(h);
     var bucket=(config.plugins&&config.plugins[name])?config.plugins[name]:{};
-    (s.fields||[]).forEach(function(f){ card.appendChild(renderField(name,f,bucket)); });
+    var isLoaded=(loaded.indexOf(name)>=0);
+    var en=document.createElement('label'); en.className='checkbox';
+    var cb=document.createElement('input'); cb.type='checkbox'; cb.id='en_'+name;
+    cb.checked=(bucket&&typeof bucket.enabled==='boolean')?bucket.enabled:true;
+    en.appendChild(cb); en.appendChild(document.createTextNode(' 启用该插件'));
+    var st=document.createElement('span'); st.className='plug-state';
+    st.textContent=isLoaded?'已加载':'未加载';
+    st.style.color=isLoaded?'var(--green)':'var(--muted)';
+    en.appendChild(st);
+    card.appendChild(en);
+
+    // 配置项容器：勾选启用立即显示（不必先保存），取消勾选收起。
+    // 收起只是隐藏 DOM，值仍在，保存时照旧写回，不会丢配置。
+    var body=document.createElement('div');
+    if(s&&s.fields&&s.fields.length){
+      (s.fields||[]).forEach(function(f){ body.appendChild(renderField(name,f,bucket)); });
+    } else {
+      var tip=document.createElement('div'); tip.className='hint';
+      tip.textContent='该插件未提供可配置项。';
+      body.appendChild(tip);
+    }
+    var offTip=document.createElement('div'); offTip.className='hint';
+    offTip.textContent='未启用：勾选上方“启用该插件”即可显示并编辑配置项，保存后立即加载。';
+    card.appendChild(body); card.appendChild(offTip);
+    cb.onchange=function(){
+      body.style.display=cb.checked?'':'none';
+      offTip.style.display=cb.checked?'none':'';
+    };
+    body.style.display=cb.checked?'':'none';
+    offTip.style.display=cb.checked?'none':'';
     wrap.appendChild(card);
   });
 }
 function renderField(name,f,bucket){
   var wrap=document.createElement('div'); var label=document.createElement('label'); label.textContent=f.label; wrap.appendChild(label);
+  // 数组字段：渲染为可增删行的表格（每行一个对象）
+  if(f.type==='array'){
+    var cols=f.fields||[], cid='a_'+name+'_'+f.key;
+    arrays[cid]=cols;
+    var rows=getNested(bucket,f.key);
+    if(!Array.isArray(rows)) rows=[];
+    var tb=document.createElement('table'); tb.className='array';
+    var head=document.createElement('thead'), htr=document.createElement('tr');
+    cols.forEach(function(c){ var th=document.createElement('th'); th.textContent=c.label; htr.appendChild(th); });
+    var thOp=document.createElement('th'); thOp.textContent='操作'; htr.appendChild(thOp);
+    head.appendChild(htr); tb.appendChild(head);
+    var bodyEl=document.createElement('tbody'); bodyEl.id='arrbody_'+cid; tb.appendChild(bodyEl);
+    wrap.appendChild(tb);
+    var add=document.createElement('button'); add.type='button'; add.className='btn-ghost btn-add'; add.textContent='+ 添加一行';
+    add.onclick=function(){
+      var r=arrRead(cid,cols), o={};
+      cols.forEach(function(c){ o[c.key]=(c.type==='bool')?true:(c.type==='number'?0:''); });
+      r.push(o); arrRender(cid,cols,r);
+    };
+    wrap.appendChild(add);
+    if(f.hint){ var h2=document.createElement('div'); h2.className='hint'; h2.textContent=f.hint; wrap.appendChild(h2); }
+    arrRender(cid,cols,rows);
+    return wrap;
+  }
   var id='f_'+name+'_'+f.key; var el;
   if(f.type==='bool'){ el=document.createElement('input'); el.type='checkbox'; el.checked=!!getNested(bucket,f.key); }
   else if(f.type==='number'){ el=document.createElement('input'); el.type='number'; var v=getNested(bucket,f.key); el.value=(v==null?'':v); }
@@ -91,23 +198,36 @@ function renderField(name,f,bucket){
   if(f.hint){ var hint=document.createElement('div'); hint.className='hint'; hint.textContent=f.hint; wrap.appendChild(hint); }
   return wrap;
 }
-function collectPlugins(sc){
+function collectPlugins(sc, cfg){
   var plugins={};
-  Object.keys(sc).forEach(function(name){
-    var s=sc[name]; var bucket={};
-    (s.fields||[]).forEach(function(f){
-      var el=document.getElementById('f_'+name+'_'+f.key); if(!el) return;
-      if(f.type==='bool') setNested(bucket,f.key,el.checked);
-      else if(f.type==='number') setNested(bucket,f.key,parseInt(el.value,10)||0);
-      else setNested(bucket,f.key,el.value);
-    });
+  pluginNames(sc).forEach(function(name){
+    var s=sc[name];
+    // 以服务端原桶为底稿，避免禁用插件（字段未渲染）时丢失已保存的配置
+    var old=(cfg&&cfg.plugins&&cfg.plugins[name])?cfg.plugins[name]:{};
+    var bucket={};
+    try{ bucket=JSON.parse(JSON.stringify(old)); }catch(e){ bucket={}; }
+    if(s){
+      (s.fields||[]).forEach(function(f){
+        if(f.type==='array'){
+          var cid='a_'+name+'_'+f.key;
+          setNested(bucket,f.key,arrRead(cid,arrays[cid]||f.fields||[]));
+          return;
+        }
+        var el=document.getElementById('f_'+name+'_'+f.key); if(!el) return;
+        if(f.type==='bool') setNested(bucket,f.key,el.checked);
+        else if(f.type==='number') setNested(bucket,f.key,parseInt(el.value,10)||0);
+        else setNested(bucket,f.key,el.value);
+      });
+    }
+    var cb=document.getElementById('en_'+name);
+    bucket.enabled=cb?cb.checked:true;
     plugins[name]=bucket;
   });
   return plugins;
 }
 function load(){
   fetch('/api/config').then(function(r){ return r.json(); }).then(function(d){
-    var cfg=d.config||{}; schemas=d.schemas||{};
+    var cfg=d.config||{}; schemas=d.schemas||{}; available=d.available_plugins||[]; loaded=d.loaded_plugins||[]; curCfg=cfg;
     $('uuid').value=cfg.uuid||''; $('name').value=cfg.name||''; $('autostart').checked=!!cfg.autostart;
     $('http_listen').value=(cfg.http?cfg.http.listen:'');
     renderPlugins(schemas,cfg); loadStatus();
@@ -125,9 +245,13 @@ function updateBadge(s){
 }
 $('form').addEventListener('submit', function(e){
   e.preventDefault();
-  var data={ uuid:$('uuid').value, name:$('name').value, autostart:$('autostart').checked, http:{listen:$('http_listen').value}, plugins:collectPlugins(schemas) };
+  var data={ uuid:$('uuid').value, name:$('name').value, autostart:$('autostart').checked, http:{listen:$('http_listen').value}, plugins:collectPlugins(schemas,curCfg) };
   fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
-    .then(function(r){ return r.json(); }).then(function(d){ if(!d.ok){ toast('保存失败: '+(d.error||'')); } else { toast('已保存并应用'); load(); } })
+    .then(function(r){ return r.json(); }).then(function(d){
+      if(!d.ok){ toast('保存失败: '+(d.error||'')); }
+      else { toast('已保存并应用');
+        if(d.schemas){ schemas=d.schemas; available=d.available_plugins||available; loaded=d.loaded_plugins||loaded; curCfg=d.config||curCfg; renderPlugins(schemas,curCfg); loadStatus(); }
+        else load(); } })
     .catch(function(e){ toast('保存失败: '+e.message); });
 });
 $('updateBtn').addEventListener('click', function(){

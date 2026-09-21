@@ -62,5 +62,7 @@ endif()
 
 # 资源（图标 + 配置页）已全部内嵌进 exe，运行时不再依赖外部 assets 目录。
 
-# ---- reporter 插件（动态库）----
-add_subdirectory(src/plugins/reporter)
+# ---- 插件（动态库，输出到 plugins/）----
+add_subdirectory(src/plugins/reporter)   # RemoteStorage 上报
+add_subdirectory(src/plugins/mqtt)       # MQTT 远程命令
+add_subdirectory(src/plugins/scheduler)  # 定时任务（类 crontab）

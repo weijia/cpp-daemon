@@ -17,6 +17,14 @@ namespace {
 void logErr(const std::string& msg) { std::fprintf(stderr, "[plugin] %s\n", msg.c_str()); }
 void logInfo(const std::string& msg) { std::fprintf(stdout, "[plugin] %s\n", msg.c_str()); }
 
+// 插件桶内的启用开关：plugins.<name>.enabled，缺省为 true（兼容无该字段的旧配置）。
+bool bucketEnabled(const nlohmann::json& bucket) {
+  if (!bucket.is_object()) return true;
+  auto it = bucket.find("enabled");
+  if (it == bucket.end() || !it->is_boolean()) return true;
+  return it->get<bool>();
+}
+
 // 跨平台动态库句柄
 struct LibHandle {
 #ifdef _WIN32
@@ -108,6 +116,10 @@ PluginManager::~PluginManager() { shutdownAll(); }
 
 void PluginManager::loadAll(const std::map<std::string, nlohmann::json>& plugins,
                             const Identity& identity) {
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    buckets_ = plugins;
+  }
   auto libs = listLibs(dir_);
   std::string suf = suffix();
   for (auto& fname : libs) {
@@ -117,8 +129,61 @@ void PluginManager::loadAll(const std::map<std::string, nlohmann::json>& plugins
       logInfo("插件 " + base + " 无对应配置桶，跳过");
       continue;
     }
+    if (!bucketEnabled(it->second)) {
+      logInfo("插件 " + base + " 已禁用（enabled=false），跳过");
+      continue;
+    }
     loadOne(base, dir_ + "/" + fname, it->second, identity);
   }
+}
+
+void PluginManager::load(const std::string& name, const nlohmann::json& bucket,
+                         const Identity& identity) {
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (entries_.count(name)) return;  // 已加载
+    buckets_[name] = bucket;           // 纳入跨插件可见视图
+  }
+  loadOne(name, dir_ + "/" + name + suffix(), bucket, identity);
+}
+
+void PluginManager::unload(const std::string& name) {
+  Entry e;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = entries_.find(name);
+    if (it == entries_.end()) return;
+    e = it->second;
+    entries_.erase(it);
+    buckets_.erase(name);
+  }
+  // 在锁外释放，避免插件回调重入管理器造成死锁
+  try {
+    e.plugin->shutdown();
+  } catch (...) {
+  }
+  if (e.destroyFn) e.destroyFn(e.plugin);
+  LibHandle lh;
+  lh.h = reinterpret_cast<HMODULE>(e.handle);
+  closeLib(lh);
+  logInfo("插件 " + name + " 已卸载");
+}
+
+std::map<std::string, nlohmann::json> PluginManager::allBuckets() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return buckets_;
+}
+
+std::vector<std::string> PluginManager::availablePlugins() const {
+  std::string suf = suffix();
+  std::vector<std::string> out;
+  for (auto& fname : listLibs(dir_)) out.push_back(fname.substr(0, fname.size() - suf.size()));
+  return out;
+}
+
+bool PluginManager::isLoaded(const std::string& name) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return entries_.count(name) != 0;
 }
 
 void PluginManager::loadOne(const std::string& name, const std::string& path,
@@ -154,7 +219,7 @@ void PluginManager::loadOne(const std::string& name, const std::string& path,
     closeLib(lh);
     return;
   }
-  AppConfig ac{identity, bucket};
+  AppConfig ac{identity, bucket, allBuckets()};
   bool ok = false;
   SAFE_CALL(ok, p->configure(ac), false);
   if (!ok) {
@@ -188,10 +253,11 @@ void PluginManager::loadOne(const std::string& name, const std::string& path,
 void PluginManager::applyConfig(const std::map<std::string, nlohmann::json>& plugins,
                                 const Identity& identity) {
   std::lock_guard<std::mutex> lk(mu_);
+  buckets_ = plugins;
   for (auto& kv : entries_) {
     auto it = plugins.find(kv.first);
     if (it == plugins.end()) continue;
-    AppConfig ac{identity, it->second};
+    AppConfig ac{identity, it->second, buckets_};
     bool ok = false;
     SAFE_CALL(ok, kv.second.plugin->onConfigChanged(ac), false);
     if (!ok) logErr("插件 " + kv.first + " onConfigChanged 失败");
@@ -221,6 +287,50 @@ std::map<std::string, ConfigSchema> PluginManager::schemas() const {
     SAFE_CALL(s, kv.second.plugin->configSchema(), ConfigSchema{});
     if (!s.name.empty()) out[kv.first] = s;
   }
+  return out;
+}
+
+ConfigSchema PluginManager::probeSchema(const std::string& name) const {
+  ConfigSchema out;
+  std::string path = dir_ + "/" + name + suffix();
+  LibHandle lh = loadLib(path);
+  if (!lh.ok()) return out;
+  auto createFn = reinterpret_cast<create_plugin_fn>(sym(lh, "create_plugin"));
+  auto destroyFn = reinterpret_cast<destroy_plugin_fn>(sym(lh, "destroy_plugin"));
+  if (!createFn || !destroyFn) {
+    closeLib(lh);
+    return out;
+  }
+  Plugin* p = nullptr;
+  try {
+    p = createFn();
+  } catch (...) {
+    p = nullptr;
+  }
+  if (p) {
+    // 只取元数据：不 configure、不启动任何线程/连接
+    if (p->protocolVersion() == kProtocolVersion)
+      SAFE_CALL(out, p->configSchema(), ConfigSchema{});
+    destroyFn(p);
+  }
+  closeLib(lh);
+  return out;
+}
+
+std::map<std::string, ConfigSchema> PluginManager::allSchemas() const {
+  std::map<std::string, ConfigSchema> out = schemas();
+  for (auto& name : availablePlugins()) {
+    if (out.count(name)) continue;
+    ConfigSchema s = probeSchema(name);
+    if (!s.name.empty()) out[name] = s;
+  }
+  return out;
+}
+
+std::vector<std::string> PluginManager::loadedPlugins() const {
+  std::vector<std::string> out;
+  std::lock_guard<std::mutex> lk(mu_);
+  for (auto& kv : entries_) out.push_back(kv.first);
   return out;
 }
 

@@ -13,7 +13,8 @@
 namespace cppdaemon {
 
 // 协议版本：宿主与插件必须一致，否则拒绝加载。
-constexpr int kProtocolVersion = 1;
+// v2：AppConfig 增加 allPlugins（跨插件只读配置视图）。
+constexpr int kProtocolVersion = 2;
 
 struct Identity {
   std::string uuid;
@@ -25,6 +26,9 @@ struct Identity {
 struct AppConfig {
   Identity identity;
   nlohmann::json pluginConfig;  // 仅本插件桶，如 config.plugins["reporter"]
+  // 全部插件的配置桶（只读视图）：插件可据此读取其它插件的配置，
+  // 避免同一份参数（如服务器地址/令牌）在多处重复配置。
+  std::map<std::string, nlohmann::json> allPlugins;
 };
 
 struct TrayItem {
