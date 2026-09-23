@@ -1,0 +1,7 @@
+适用于 .NET Framework MSBuild 版本 17.14.60+43b635718
+
+  mqtt.vcxproj -> C:\codes\tray-app\cpp-daemon\build\Release\plugins\mqtt.dll
+  reporter.vcxproj -> C:\codes\tray-app\cpp-daemon\build\Release\plugins\reporter.dll
+    正在创建库 C:/codes/tray-app/cpp-daemon/build/src/plugins/scheduler/Release/scheduler.lib 和对象 C:/codes/tray-app/cpp-daemon/build/src/plugins/scheduler/Release/scheduler.exp
+  cpp-daemon.vcxproj -> C:\codes\tray-app\cpp-daemon\build\Release\cpp-daemon.exe
+  scheduler.vcxproj -> C:\codes\tray-app\cpp-daemon\build\Release\plugins\scheduler.dll

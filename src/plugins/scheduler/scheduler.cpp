@@ -68,6 +68,98 @@ void slog(const char* fmt, ...) {
   va_end(ap);
 }
 
+// ---------- 执行命令并捕获输出（Windows 下隐藏黑窗口） ----------
+// Windows: CreateProcess + CREATE_NO_WINDOW，彻底不弹控制台窗口；stdout/stderr 合并到管道。
+// 其它平台: 沿用 popen。两路都逐行实时写日志（调用方已附 "2>&1"）。
+static void runCaptured(const std::string& command, std::string& out, bool& ok,
+                        std::string& err, const std::string& name) {
+#ifdef _WIN32
+  SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
+  HANDLE hRead = nullptr, hWrite = nullptr;
+  if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
+    err = "无法创建管道";
+    ok = false;
+    return;
+  }
+  SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);  // 读端不继承给子进程
+
+  // stdin 接到 NUL，避免子进程因等待输入而卡住
+  HANDLE hNull = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ, &sa,
+                             OPEN_EXISTING, 0, nullptr);
+
+  STARTUPINFOA si = {sizeof(si)};
+  si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+  si.hStdInput = (hNull != INVALID_HANDLE_VALUE) ? hNull : nullptr;
+  si.hStdOutput = hWrite;
+  si.hStdError = hWrite;   // stderr 合并到同一管道
+  si.wShowWindow = SW_HIDE;
+
+  PROCESS_INFORMATION pi = {0};
+  std::string cmdline = "cmd.exe /C " + command;
+  BOOL created = CreateProcessA(nullptr, const_cast<char*>(cmdline.c_str()), nullptr,
+                                nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+  if (hNull != INVALID_HANDLE_VALUE) CloseHandle(hNull);
+  if (!created) {
+    DWORD e = GetLastError();
+    CloseHandle(hRead);
+    CloseHandle(hWrite);
+    err = "无法启动命令 (error " + std::to_string(e) + ")";
+    ok = false;
+    return;
+  }
+  CloseHandle(hWrite);  // 关闭父端写句柄，子进程退出时管道读到 EOF
+  CloseHandle(pi.hThread);
+
+  char buf[512];
+  DWORD n = 0;
+  std::string line;
+  while (ReadFile(hRead, buf, sizeof(buf), &n, nullptr) && n > 0) {
+    for (DWORD i = 0; i < n; ++i) {
+      char c = buf[i];
+      if (c == '\n') {
+        slog("[scheduler] [%s] %s\n", name.c_str(), line.c_str());
+        out += line;
+        out += '\n';
+        line.clear();
+      } else if (c != '\r') {
+        line += c;
+      }
+    }
+  }
+  if (!line.empty()) {
+    slog("[scheduler] [%s] %s\n", name.c_str(), line.c_str());
+    out += line;
+    out += '\n';
+  }
+  CloseHandle(hRead);
+
+  DWORD exitCode = 0;
+  if (GetExitCodeProcess(pi.hProcess, &exitCode) && exitCode != STILL_ACTIVE) {
+    ok = (exitCode == 0);
+    if (!ok) err = "exit code " + std::to_string((int)exitCode);
+  } else {
+    ok = false;
+    err = "无法获取退出码";
+  }
+  CloseHandle(pi.hProcess);
+#else
+  FILE* pipe = RUN_POPEN(command.c_str(), "r");
+  if (pipe) {
+    char buf[512];
+    while (fgets(buf, sizeof(buf), pipe)) {
+      out += buf;
+      slog("[scheduler] [%s] %s", name.c_str(), buf);
+    }
+    int code = RUN_PCLOSE(pipe);
+    ok = (code == 0);
+    if (!ok) err = "exit code " + std::to_string(code);
+  } else {
+    err = "无法启动命令";
+    ok = false;
+  }
+#endif
+}
+
 // ---------- cron 表达式 ----------
 std::vector<std::string> splitTokens(const std::string& s) {
   std::vector<std::string> out;
@@ -173,6 +265,7 @@ struct TaskState {
   std::string lastError;
   std::string lastCronKey;  // 用于同一分钟内不重复触发
   int runs = 0;
+  bool running = false;     // 当前是否有该任务的命令在独立线程中执行
 };
 
 class Scheduler : public cppdaemon::Plugin {
@@ -347,11 +440,17 @@ private:
         if (now - st.lastRun >= (int64_t)t.intervalMinutes * 60) fire = true;
       }
       if (!fire) continue;
-      if (!t.cron.empty()) {
+      {
         std::lock_guard<std::mutex> lk(stMu_);
-        states_[i].lastCronKey = key;
+        if (states_[i].running) {
+          slog("[scheduler] 任务 [%s] 上次仍未结束，跳过本次触发\n", t.name.c_str());
+          continue;
+        }
+        if (!t.cron.empty()) states_[i].lastCronKey = key;
+        states_[i].running = true;  // 标记占用，避免串行任务相互堆积/阻塞调度循环
       }
-      runTask(i, t);
+      // 在独立线程执行命令，tick 循环不被阻塞，长耗时任务也不会拖垮其他调度
+      std::thread([this, i, t]() { runTask(i, t); }).detach();
     }
   }
 
@@ -361,20 +460,11 @@ private:
     bool ok = false;
     std::string err;
 #ifdef _WIN32
-    std::string shell = "cmd /C " + t.command;
+    std::string command = "cmd /C " + t.command + " 2>&1";
 #else
-    std::string shell = "sh -c " + t.command;
+    std::string command = "sh -c " + t.command + " 2>&1";
 #endif
-    FILE* pipe = RUN_POPEN(shell.c_str(), "r");
-    if (pipe) {
-      char buf[512];
-      while (fgets(buf, sizeof(buf), pipe)) out += buf;
-      int code = RUN_PCLOSE(pipe);
-      ok = (code == 0);
-      if (!ok) err = "exit code " + std::to_string(code);
-    } else {
-      err = "无法启动命令";
-    }
+    runCaptured(command, out, ok, err, t.name);
     {
       std::lock_guard<std::mutex> lk(stMu_);
       TaskState& st = states_[idx];
@@ -382,8 +472,8 @@ private:
       st.lastOk = ok;
       st.lastError = err;
       st.runs += 1;
+      st.running = false;
     }
-    if (!out.empty()) slog("[scheduler] 任务 [%s] 输出: %s\n", t.name.c_str(), out.c_str());
     slog("[scheduler] 任务 [%s] 结束 ok=%d %s\n", t.name.c_str(), ok ? 1 : 0, err.c_str());
   }
 
@@ -404,20 +494,11 @@ private:
     bool ok = false;
     std::string err;
 #ifdef _WIN32
-    std::string shell = "cmd /C " + t.command;
+    std::string command = "cmd /C " + t.command + " 2>&1";
 #else
-    std::string shell = "sh -c " + t.command;
+    std::string command = "sh -c " + t.command + " 2>&1";
 #endif
-    FILE* pipe = RUN_POPEN(shell.c_str(), "r");
-    if (pipe) {
-      char buf[512];
-      while (fgets(buf, sizeof(buf), pipe)) out += buf;
-      int code = RUN_PCLOSE(pipe);
-      ok = (code == 0);
-      if (!ok) err = "exit code " + std::to_string(code);
-    } else {
-      err = "无法启动命令";
-    }
+    runCaptured(command, out, ok, err, t.name);
     return {{"ok", ok}, {"output", out}, {"error", err}};
   }
 
