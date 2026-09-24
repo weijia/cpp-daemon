@@ -22,6 +22,8 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <iphlpapi.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #endif
 
 // 插件自包含：复刻宿主 Config.cpp 的配置解析与 URL 工具。
@@ -553,7 +555,7 @@ private:
 #endif
       p.version = identity_.version;
       p.internalIPs = internalIPs();
-      p.externalIP = externalIP();
+      p.externalIP = externalIP(c.remotestorage.proxy);
     }
     p.capabilities = localCapabilities();
     p.mqtt = mqttPayloadFrom(allPluginsSnapshot());
@@ -613,14 +615,33 @@ private:
   std::vector<std::string> internalIPs() {
     std::vector<std::string> ips;
 #ifdef _WIN32
+    // 用 GetAdaptersAddresses 替代废弃的 GetAdaptersInfo：可拿到 IPv6，并过滤回环/链路本地
     ULONG size = 0;
-    if (GetAdaptersInfo(nullptr, &size) != ERROR_BUFFER_OVERFLOW) return ips;
+    if (GetAdaptersAddresses(AF_UNSPEC, 0, nullptr, nullptr, &size) != ERROR_BUFFER_OVERFLOW)
+      return ips;  // size 仍为 0 -> 本机无法枚举，直接返回
     std::vector<unsigned char> buf(size);
-    if (GetAdaptersInfo((PIP_ADAPTER_INFO)buf.data(), &size) != NO_ERROR) return ips;
-    for (PIP_ADAPTER_INFO a = (PIP_ADAPTER_INFO)buf.data(); a; a = a->Next) {
-      for (PIP_ADDR_STRING s = &a->IpAddressList; s; s = s->Next) {
-        std::string ip(s->IpAddress.String);
-        if (ip == "0.0.0.0") continue;
+    auto* adas = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+    if (GetAdaptersAddresses(AF_UNSPEC, 0, nullptr, adas, &size) != NO_ERROR) return ips;
+    for (auto* a = adas; a; a = a->Next) {
+      if (a->OperStatus != IfOperStatusUp) continue;  // 跳过未连接的网卡
+      for (auto* ua = a->FirstUnicastAddress; ua; ua = ua->Next) {
+        auto fam = ua->Address.lpSockaddr->sa_family;
+        char str[INET6_ADDRSTRLEN] = {0};
+        if (fam == AF_INET) {
+          auto* sin = reinterpret_cast<SOCKADDR_IN*>(ua->Address.lpSockaddr);
+          inet_ntop(AF_INET, &sin->sin_addr, str, sizeof(str));
+        } else if (fam == AF_INET6) {
+          auto* sin6 = reinterpret_cast<SOCKADDR_IN6*>(ua->Address.lpSockaddr);
+          inet_ntop(AF_INET6, &sin6->sin6_addr, str, sizeof(str));
+        } else {
+          continue;
+        }
+        std::string ip(str);
+        if (fam == AF_INET) {
+          if (ip == "127.0.0.1" || ip.compare(0, 8, "169.254.") == 0) continue;  // 回环/链路本地
+        } else {
+          if (ip == "::1" || ip.compare(0, 4, "fe80") == 0) continue;            // 回环/链路本地
+        }
         ips.push_back(ip);
       }
     }
@@ -628,13 +649,38 @@ private:
     return ips;
   }
 
-  std::string externalIP() {
-    try {
-      httplib::Client cli("https://api.ipify.org");
-      auto r = cli.Get("/?format=text");
-      if (r && r->status == 200) return r->body;
-    } catch (...) {
+  // 外网 IP：沿用 sync() 的代理逻辑（配置 proxy -> 环境变量兜底），并用多服务兜底；
+  // 失败会打日志而非静默返回空，便于定位（公司网络通常需配置 remotestorage.proxy）。
+  std::string externalIP(const std::string& cfgProxy) {
+    struct Prov { std::string host, path; };
+    static const Prov kProviders[] = {
+        {"https://api.ipify.org", "/?format=text"},
+        {"https://ifconfig.me", "/ip"},
+        {"https://icanhazip.com", "/"},
+    };
+    std::string proxy = cfgProxy.empty() ? envProxy() : cfgProxy;
+    std::string ph; int pp = 0;
+    bool haveProxy = !proxy.empty() && parseProxy(proxy, ph, pp);
+    for (const auto& pr : kProviders) {
+      try {
+        httplib::Client cli(pr.host);
+        cli.enable_server_certificate_verification(true);
+        if (haveProxy) cli.set_proxy(ph, pp);
+        auto r = cli.Get(pr.path);
+        if (r && r->status == 200 && !r->body.empty()) {
+          std::string s = r->body;
+          s.erase(0, s.find_first_not_of(" \t\r\n"));
+          s.erase(s.find_last_not_of(" \t\r\n") + 1);
+          if (!s.empty()) {
+            rlog("[reporter] 外网 IP 获取成功 (%s): %s\n", pr.host.c_str(), s.c_str());
+            return s;
+          }
+        }
+      } catch (...) {
+      }
+      rlog("[reporter] 外网 IP 获取失败，尝试下一个服务: %s\n", pr.host.c_str());
     }
+    rlog("[reporter] 外网 IP 获取失败（如处公司网络，请在配置页填写 remotestorage.proxy）\n");
     return "";
   }
 

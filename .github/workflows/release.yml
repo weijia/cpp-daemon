@@ -1,0 +1,147 @@
+name: Release
+
+# 触发方式：
+#   1) push 到 master 自动发版（忽略纯文档改动）
+#   2) 右上角 Actions → Run workflow 手动触发，可选 major/minor/patch 自增方式
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/**'
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 版本号自增方式（仅在已存在 tag 时生效）
+        required: false
+        default: patch
+        type: choice
+        options: [patch, minor, major]
+
+permissions:
+  contents: write
+
+env:
+  # Conan 主目录放在仓库内，便于用 actions/cache 缓存二进制包（省去每次重编 OpenSSL）
+  CONAN_HOME: ${{ github.workspace }}/.conan2
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 需要完整 tag 历史来推算下一个版本号
+
+      - name: Compute next version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUMP="${{ inputs.bump || 'patch' }}"
+
+          # 基准版本写在 CMakeLists.txt 的 project(cpp-daemon VERSION x.y.z)
+          # 注意：grep 无匹配会返回 1，必须 || true，否则 set -e 会中止脚本
+          BASE="$(grep -Eo 'project\([[:space:]]*cpp-daemon[[:space:]]+VERSION[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+' CMakeLists.txt \
+                 | head -n1 | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+          if [ -z "$BASE" ]; then
+            BASE="0.0.1"
+          fi
+
+          # 取最新语义化版本 tag；没有 tag 说明是首个 release，直接用基准版本
+          LAST="$(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
+
+          if [ -z "$LAST" ]; then
+            VERSION="$BASE"
+          else
+            CUR="${LAST#v}"
+            IFS='.' read -r MA MI PA <<< "$CUR"
+            case "$BUMP" in
+              major) MA=$((MA+1)); MI=0; PA=0 ;;
+              minor) MI=$((MI+1)); PA=0 ;;
+              *)     PA=$((PA+1)) ;;
+            esac
+            VERSION="$MA.$MI.$PA"
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "::notice::release version = $VERSION (last tag: ${LAST:-none}, bump: $BUMP)"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Conan packages
+        uses: actions/cache@v4
+        with:
+          path: .conan2
+          key: conan-${{ runner.os }}-${{ hashFiles('conanfile.txt') }}
+          restore-keys: conan-${{ runner.os }}-
+
+      - name: Install Conan 2
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "conan>=2.0,<3"
+
+      - name: Detect Conan profile
+        run: python -m conan profile detect --force
+
+      - name: Conan install dependencies
+        run: python -m conan install . --output-folder=build --build=missing
+
+      - name: Configure CMake (inject version)
+        run: cmake --preset conan-default "-DCPPD_VERSION=${{ steps.ver.outputs.version }}"
+
+      - name: Build Release (exe + plugins)
+        run: cmake --build --preset conan-release
+
+      - name: Collect and package artifacts
+        shell: pwsh
+        run: |
+          $Version = "${{ steps.ver.outputs.version }}"
+          $stage = Join-Path $pwd "dist\cpp-daemon"
+          New-Item -ItemType Directory -Force -Path "$stage\plugins" | Out-Null
+          if (-not (Test-Path "build\Release\cpp-daemon.exe")) { throw "未找到 cpp-daemon.exe" }
+          if (-not (Test-Path "build\Release\plugins")) { throw "未找到 plugins 目录" }
+          Copy-Item "build\Release\cpp-daemon.exe" "$stage\" -Force
+          Copy-Item "build\Release\plugins\*.dll" "$stage\plugins\" -Force
+          Set-Content -Path "$stage\VERSION.txt" -Value $Version -NoNewline
+          Write-Host "=== 打包内容 ==="
+          Get-ChildItem -Recurse $stage | ForEach-Object { Write-Host ("  " + $_.FullName + "  " + $_.Length) }
+          $zip = Join-Path $pwd "cpp-daemon-v$Version-win-x64.zip"
+          Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
+          Write-Host "created $zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpp-daemon-v${{ steps.ver.outputs.version }}-win-x64
+          path: cpp-daemon-v${{ steps.ver.outputs.version }}-win-x64.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: cpp-daemon ${{ steps.ver.outputs.tag }}
+          body: |
+            自动构建发布（Windows x64），版本号 ${{ steps.ver.outputs.version }}。
+
+            **包含文件**
+            - `cpp-daemon.exe`
+            - `plugins/reporter.dll`、`plugins/mqtt.dll`、`plugins/scheduler.dll`
+            - `VERSION.txt`（构建时注入的版本号，同时也是上报到 RemoteStorage 的 version）
+
+            **运行要求**：目标机器需安装 Visual C++ 运行库（VC_redist.x64）。
+
+            **校验**：启动后托盘会按间隔上报，RemoteStorage 节点里的 `version` 即为本版本号。
+
+            Commit: ${{ github.sha }}
+          files: cpp-daemon-v${{ steps.ver.outputs.version }}-win-x64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

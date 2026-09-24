@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(cpp-daemon LANGUAGES CXX)
+project(cpp-daemon VERSION 0.0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,9 +17,9 @@ if(HEADLESS)
   add_compile_definitions(CPPDAEMON_HEADLESS)
 endif()
 
-# 版本：可由 -DCPPD_VERSION=... 注入，默认 dev
+# 版本：CI/本地可用 -DCPPD_VERSION=... 覆盖，否则取上面的 project(VERSION)
 if(NOT DEFINED CPPD_VERSION)
-  set(CPPD_VERSION "dev")
+  set(CPPD_VERSION "${PROJECT_VERSION}")
 endif()
 add_compile_definitions(CPPD_VERSION="${CPPD_VERSION}")
 
