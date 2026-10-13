@@ -76,6 +76,28 @@ static void mlog(const char* fmt, ...) {
   va_end(ap);
 }
 
+// 把本地编码（Windows 默认 GBK/ACP）的命令输出转成 UTF-8，避免 JSON 序列化时
+// 因含非 UTF-8 字节而抛异常（此前表现为 executeCommand 异常: invalid UTF-8）。
+static std::string toUtf8(const std::string& local) {
+#ifdef _WIN32
+  if (local.empty()) return local;
+  int wlen = MultiByteToWideChar(CP_ACP, 0, local.data(), (int)local.size(), nullptr, 0);
+  if (wlen <= 0) return local;
+  std::wstring w(wlen, L'\0');
+  if (MultiByteToWideChar(CP_ACP, 0, local.data(), (int)local.size(), &w[0], wlen) != wlen)
+    return local;
+  int ulen = WideCharToMultiByte(CP_UTF8, 0, w.data(), wlen, nullptr, 0, nullptr, nullptr);
+  if (ulen <= 0) return local;
+  std::string u(ulen, '\0');
+  if (WideCharToMultiByte(CP_UTF8, 0, w.data(), wlen, &u[0], ulen, nullptr, nullptr) != ulen)
+    return local;
+  return u;
+#else
+  (void)local;
+  return local;  // 非 Windows 假设输出已是 UTF-8
+#endif
+}
+
 }  // namespace
 
 namespace mqttplugin {
@@ -286,7 +308,10 @@ private:
         }
         void message_arrived(mqtt::const_message_ptr m) override {
           std::string plain;
-          if (!daemoncrypto::decryptAES(cfg.secret, m->to_string(), plain)) {
+          if (cfg.secret.empty()) {
+            // 明文模式：secret 为空，payload 直接当作 JSON 命令
+            plain = m->to_string();
+          } else if (!daemoncrypto::decryptAES(cfg.secret, m->to_string(), plain)) {
             mlog("[mqtt] 解密失败（请检查 AES 密钥是否与服务端一致）\n");
             return;
           }
@@ -406,18 +431,33 @@ private:
     }
     mlog("[mqtt] 命令执行结束 ok=%d %s\n", ok ? 1 : 0, err.c_str());
 
-    nlohmann::json rep = {{"id", src.value("id", "")},
-                          {"msgId", src.value("msgId", "")},
-                          {"user", src.value("user", "")},
-                          {"ok", ok},
-                          {"output", out},
-                          {"error", err},
-                          {"time", (int64_t)std::time(nullptr) * 1000}};
+    // 回显发送命令的全部字段（id/msgId/user/msg 等），保证回执结构与请求一致，
+    // 客户端可据此把回执与请求对应；再追加执行结果字段。
+    nlohmann::json rep = nlohmann::json::object();
+    if (src.is_object()) rep = src;
+    rep["ok"] = ok;
+    rep["output"] = toUtf8(out);
+    rep["error"] = err;
+    rep["time"] = (int64_t)std::time(nullptr) * 1000;
     lastResult_ = ok ? "ok" : err;
-    std::string cipher = daemoncrypto::encryptAES(c.secret, rep.dump());
+    // dump 用 replace 兜底：即便仍有非法字节也序列化成功，保证回执一定能发出（绝不崩溃）。
+    // secret 为空走明文模式（payload 直接是 JSON），否则 AES 加密。
+    std::string payload = c.secret.empty()
+        ? rep.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)
+        : daemoncrypto::encryptAES(c.secret,
+              rep.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
     try {
       std::lock_guard<std::mutex> lk(cliMu_);
-      if (cli_) cli_->publish(mqtt::make_message(c.topic + "/reply", cipher, 1, false));
+      if (cli_) {
+        cli_->publish(mqtt::make_message(c.topic + "/reply", payload, 1, false));
+        mlog("[mqtt] 回执已发布 topic=%s len=%zu 模式=%s\n",
+             (c.topic + "/reply").c_str(), payload.size(),
+             c.secret.empty() ? "明文" : "加密");
+        mlog("[mqtt] 回执明文: %s\n", rep.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace).c_str());
+        mlog("[mqtt] 回执%s: %s\n", c.secret.empty() ? "内容" : "密文", payload.c_str());
+      } else {
+        mlog("[mqtt] 回执未发送：client 为空（未连接）\n");
+      }
     } catch (const std::exception& ex) {
       mlog("[mqtt] 回执失败: %s\n", ex.what());
     }
