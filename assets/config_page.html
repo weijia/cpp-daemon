@@ -190,12 +190,25 @@ function renderField(name,f,bucket){
     arrRender(cid,cols,rows,bodyEl);  // 此时 tbody 尚未挂入文档，必须用元素引用直接渲染
     return wrap;
   }
-  var id='f_'+name+'_'+f.key; var el;
+  var id='f_'+name+'_'+f.key; var el; var pwBtn=null;
   if(f.type==='bool'){ el=document.createElement('input'); el.type='checkbox'; el.checked=!!getNested(bucket,f.key); }
-  else if(f.type==='number'){ el=document.createElement('input'); el.type='number'; var v=getNested(bucket,f.key); el.value=(v==null?'':v); }
+  else if(f.type==='number'){ el=document.createElement('input'); el.type='number'; var v=getNested(bucket,f.key); el.value=(v==null?'':v); if(f.def) el.placeholder=f.def; }
   else if(f.type==='select'){ el=document.createElement('select'); (f.options||[]).forEach(function(o){ var op=document.createElement('option'); op.value=o; op.textContent=o; if(getNested(bucket,f.key)===o) op.selected=true; el.appendChild(op); }); }
-  else { el=document.createElement('input'); el.type=(f.type==='password'?'password':'text'); var vv=getNested(bucket,f.key); el.value=(vv==null?'':vv); }
-  el.id=id; wrap.appendChild(el);
+  else if(f.type==='password'){
+    el=document.createElement('input'); el.type='password'; var vv=getNested(bucket,f.key); el.value=(vv==null?'':vv); if(f.def) el.placeholder=f.def;
+    pwBtn=document.createElement('button'); pwBtn.type='button'; pwBtn.className='btn-ghost';
+    pwBtn.textContent='显示'; pwBtn.style.cssText='padding:6px 12px;white-space:nowrap;flex:0 0 auto';
+    pwBtn.onclick=function(){ if(el.type==='password'){ el.type='text'; pwBtn.textContent='隐藏'; } else { el.type='password'; pwBtn.textContent='显示'; } };
+  }
+  else { el=document.createElement('input'); el.type='text'; var vvv=getNested(bucket,f.key); el.value=(vvv==null?'':vvv); if(f.def) el.placeholder=f.def; }
+  el.id=id;
+  if(pwBtn){
+    var pwWrap=document.createElement('div'); pwWrap.style.cssText='display:flex;gap:8px;align-items:center';
+    el.style.flex='1'; el.style.width='auto';
+    pwWrap.appendChild(el); pwWrap.appendChild(pwBtn); wrap.appendChild(pwWrap);
+  } else {
+    wrap.appendChild(el);
+  }
   if(f.hint){ var hint=document.createElement('div'); hint.className='hint'; hint.textContent=f.hint; wrap.appendChild(hint); }
   return wrap;
 }

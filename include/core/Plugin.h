@@ -53,6 +53,7 @@ struct Field {
   std::string hint;
   std::vector<std::string> options;  // select 用
   std::vector<Field> fields;         // 嵌套对象（预留）
+  std::string def;                   // 缺省值/占位提示（如文本框缺省 broker 地址）
 };
 
 struct ConfigSchema {

@@ -32,6 +32,7 @@
 namespace {
 
 constexpr const char* kDefaultTopic = "ufsd/cmd";
+constexpr const char* kDefaultBroker = "broker.emqx.io";
 
 // ---------- 持久化日志（同时写文件与 stderr） ----------
 static std::string logFilePath() {
@@ -77,7 +78,7 @@ static void mlog(const char* fmt, ...) {
 namespace mqttplugin {
 
 struct MqttCfg {
-  std::string broker;
+  std::string broker = kDefaultBroker;
   std::string topic = kDefaultTopic;
   std::string username;
   std::string password;
@@ -88,7 +89,7 @@ struct MqttCfg {
 MqttCfg cfgFromJson(const nlohmann::json& j) {
   MqttCfg c;
   if (!j.is_object()) return c;
-  c.broker = j.value("broker", "");
+  c.broker = j.value("broker", kDefaultBroker);
   c.topic = j.value("topic", kDefaultTopic);
   c.username = j.value("username", "");
   c.password = j.value("password", "");
@@ -151,13 +152,16 @@ public:
     s.title = "MQTT 远程命令";
     // 注意：不含 enabled 字段——启停由宿主的插件加载开关统一控制。
     s.fields = {
-        {"broker", "Broker 地址", "text", "如 tcp://broker.example.com:1883"},
+        {"broker", "Broker 地址", "text", "缺省 broker.emqx.io；如 tcp://broker.emqx.io:1883"},
         {"topic", "订阅主题 Topic", "text", "回执发往 <topic>/reply"},
         {"username", "Broker 用户名", "text"},
         {"password", "Broker 密码", "password"},
         {"secret", "AES 密钥", "password", "与服务端一致：解密收到的命令、加密回执"},
         {"client_id", "ClientID", "text", "留空则用 ufsd-<uuid 前 8 位>"},
     };
+    for (auto& f : s.fields) {
+      if (f.key == "broker") f.def = kDefaultBroker;
+    }
     return s;
   }
 
