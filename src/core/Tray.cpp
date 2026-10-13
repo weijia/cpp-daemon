@@ -202,7 +202,7 @@ private:
     if (msg == WM_COMMAND) {
       int id = LOWORD(wp);
       if (id == kIdmOpen) self->openConfig();
-      else if (id == kIdmQuit) self->app_->quit();
+      else if (id == kIdmQuit) self->app_->requestQuit();
       else if (id >= kIdmPluginBase) {
         size_t idx = (size_t)id - kIdmPluginBase;
         if (idx < self->items_.size())

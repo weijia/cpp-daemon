@@ -248,6 +248,13 @@ void App::quit() {
   if (tray_) tray_->quit();
 }
 
+void App::requestQuit() {
+  // 退出清理可能耗时（插件关闭需等待连接/线程），若在托盘 UI 线程同步执行会冻结
+  // 消息循环，表现为“右键菜单点不出来”。放到独立线程，UI 线程立即返回并保持响应，
+  // 待清理完成后由 quit() 内的 tray_->quit() 投递 WM_APP+1 结束消息循环。
+  std::thread([this]() { quit(); }).detach();
+}
+
 void App::startConfigWatch() {
   // 以当前内存配置作为基准，避免启动后立即触发一次“变更”。
   {

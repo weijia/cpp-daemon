@@ -6,12 +6,14 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
 #include <map>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
 
@@ -32,7 +34,8 @@
 namespace {
 
 constexpr const char* kDefaultTopic = "ufsd/cmd";
-constexpr const char* kDefaultBroker = "broker.emqx.io";
+constexpr const char* kDefaultBroker = "tcp://broker.emqx.io:1883";  // 运行时缺省（paho 需带 tcp:// 方案）
+constexpr const char* kDefaultBrokerDisplay = "broker.emqx.io";       // UI 占位用，便于阅读
 
 // ---------- 持久化日志（同时写文件与 stderr） ----------
 static std::string logFilePath() {
@@ -111,6 +114,7 @@ public:
     }
     quit_ = false;
     thread_ = std::thread([this]() { loop(); });
+    cmdThread_ = std::thread([this]() { cmdLoop(); });
     return true;
   }
 
@@ -121,15 +125,31 @@ public:
     }
     // 干净重启连接线程（旧线程退出后再起新的，避免双客户端竞态）
     quit_ = true;
+    cmdCv_.notify_all();  // 唤醒 cmdLoop 使其看到 quit_ 并退出
     if (thread_.joinable()) thread_.join();
+    if (cmdThread_.joinable()) cmdThread_.join();
     quit_ = false;
     thread_ = std::thread([this]() { loop(); });
+    cmdThread_ = std::thread([this]() { cmdLoop(); });
     return true;
   }
 
   void shutdown() override {
     quit_ = true;
+    cmdCv_.notify_all();  // 唤醒 cmdLoop 使其看到 quit_ 并退出
+    // 先打断可能阻塞在 connect 的连接（此时 loop 不再持有 cliMu_，可立即加锁），
+    // 否则 join 会一直等到 connect 超时甚至死锁。
+    {
+      std::lock_guard<std::mutex> lk(cliMu_);
+      if (cli_) {
+        try {
+          cli_->disconnect();
+        } catch (...) {
+        }
+      }
+    }
     if (thread_.joinable()) thread_.join();
+    if (cmdThread_.joinable()) cmdThread_.join();
     std::lock_guard<std::mutex> lk(cliMu_);
     if (cli_) {
       try {
@@ -152,7 +172,7 @@ public:
     s.title = "MQTT 远程命令";
     // 注意：不含 enabled 字段——启停由宿主的插件加载开关统一控制。
     s.fields = {
-        {"broker", "Broker 地址", "text", "缺省 broker.emqx.io；如 tcp://broker.emqx.io:1883"},
+        {"broker", "Broker 地址", "text", "缺省 broker.emqx.io（tcp://broker.emqx.io:1883）"},
         {"topic", "订阅主题 Topic", "text", "回执发往 <topic>/reply"},
         {"username", "Broker 用户名", "text"},
         {"password", "Broker 密码", "password"},
@@ -160,7 +180,7 @@ public:
         {"client_id", "ClientID", "text", "留空则用 ufsd-<uuid 前 8 位>"},
     };
     for (auto& f : s.fields) {
-      if (f.key == "broker") f.def = kDefaultBroker;
+      if (f.key == "broker") f.def = kDefaultBrokerDisplay;
     }
     return s;
   }
@@ -170,15 +190,13 @@ public:
     cppdaemon::Response resp;
     if (req.path == "/api/mqtt") {
       MqttCfg c;
-      bool connected = false;
       {
         std::lock_guard<std::mutex> lk(mu_);
         c = cfg_;
       }
-      {
-        std::lock_guard<std::mutex> lk(cliMu_);
-        connected = cli_ && cli_->is_connected();
-      }
+      // 读原子标志而非调用 cli_->is_connected()：后者是 paho 阻塞 API，在 paho
+      // 内部锁被占用时会卡死（表现为 /api/mqtt 挂起）。
+      bool connected = connected_;
       nlohmann::json j = {{"broker", c.broker},
                           {"topic", c.topic},
                           {"connected", connected},
@@ -204,9 +222,17 @@ private:
 
   std::mutex cliMu_;
   std::unique_ptr<mqtt::async_client> cli_;
+  std::atomic<bool> connected_{false};  // 仅在 paho 回调/loop 中由本插件设置，供 handle 无锁读取
 
   std::thread thread_;
   std::atomic<bool> quit_{false};
+
+  // 命令队列：paho 回调线程只负责入队，实际执行/回执由 cmdThread_ 完成，
+  // 避免在 paho 回调线程内调用 publish() 导致 paho 内部重入/崩溃。
+  std::mutex cmdMu_;
+  std::condition_variable cmdCv_;
+  std::queue<std::string> commandQ_;
+  std::thread cmdThread_;
 
   std::string lastMsg_;
   std::string lastResult_;
@@ -248,15 +274,14 @@ private:
         Cb(MqttPlugin* p, MqttCfg cfg, const std::string& tp)
             : p(p), cfg(cfg), topic(tp) {}
         void connected(const std::string&) override {
-          try {
-            std::lock_guard<std::mutex> lk(p->cliMu_);
-            if (p->cli_) p->cli_->subscribe(topic, 1)->wait();
-            mlog("[mqtt] 已连接并订阅 %s\n", topic.c_str());
-          } catch (const std::exception& e) {
-            mlog("[mqtt] 订阅失败: %s\n", e.what());
-          }
+          // 严禁在 paho 回调线程里调用阻塞 client API（如 subscribe()->wait()），
+          // 否则会死锁 paho 内部锁，导致后续 is_connected()/disconnect() 全部卡死
+          // （表现为 /api/mqtt 挂起、程序退出卡死）。回调里只做标记与日志。
+          p->connected_ = true;
+          mlog("[mqtt] 已连接\n");
         }
         void connection_lost(const std::string& cause) override {
+          p->connected_ = false;
           mlog("[mqtt] 连接丢失: %s\n", cause.c_str());
         }
         void message_arrived(mqtt::const_message_ptr m) override {
@@ -265,13 +290,20 @@ private:
             mlog("[mqtt] 解密失败（请检查 AES 密钥是否与服务端一致）\n");
             return;
           }
-          p->executeCommand(cfg, plain);
+          // 回调线程只负责把命令入队并立即返回，绝不在回调内执行命令或 publish，
+          // 否则会触发 paho 内部重入导致进程崩溃（已验证：执行命令后进程自动退出）。
+          {
+            std::lock_guard<std::mutex> lk(p->cmdMu_);
+            p->commandQ_.push(plain);
+          }
+          p->cmdCv_.notify_one();
         }
       };
       Cb cb(this, c, topic);
       cli->set_callback(cb);
       mqtt::connect_options conn;
       conn.set_clean_session(true);
+      conn.set_connect_timeout(10);  // 避免 broker 不可达时 connect 长时间阻塞，拖慢退出/重载
       if (!c.username.empty()) {
         conn.set_user_name(c.username);
         conn.set_password(c.password);
@@ -280,17 +312,37 @@ private:
         std::lock_guard<std::mutex> lk(cliMu_);
         cli_ = std::move(cli);
       }
+      // 关键：connect 的 wait 必须在 cliMu_ 之外执行，否则连接成功后 paho 在
+      // 内部线程回调 connected()（也要取 cliMu_）会与本线程的 wait 形成死锁，
+      // 导致 shutdown() 的 join 永远卡住、程序无法退出。
       {
-        std::lock_guard<std::mutex> lk(cliMu_);
-        if (cli_) cli_->connect(conn)->wait();
+        mqtt::async_client* raw = nullptr;
+        {
+          std::lock_guard<std::mutex> lk(cliMu_);
+          raw = cli_.get();
+        }
+        if (raw) {
+          raw->connect(conn)->wait();
+          // 订阅放在 loop 线程（非 paho 回调线程）执行：paho 禁止在回调里调用阻塞
+          // API，否则会死锁内部锁，导致 is_connected()/disconnect() 全部卡死。
+          try {
+            raw->subscribe(topic, 1)->wait();
+            mlog("[mqtt] 已连接并订阅 %s\n", topic.c_str());
+          } catch (const std::exception& e) {
+            mlog("[mqtt] 订阅失败: %s\n", e.what());
+          }
+        }
       }
       while (!quit_) std::this_thread::sleep_for(std::chrono::seconds(2));
-      std::lock_guard<std::mutex> lk(cliMu_);
+      // 断开连接：wait 不在 cliMu_ 保护下进行，避免与 connection_lost 回调争锁死锁
       if (cli_) {
         try {
           cli_->disconnect()->wait();
         } catch (...) {
         }
+      }
+      {
+        std::lock_guard<std::mutex> lk(cliMu_);
         cli_.reset();
       }
     } catch (const std::exception& e) {
@@ -298,8 +350,32 @@ private:
     }
   }
 
+  // 独立 worker 线程：从命令队列取出消息执行并回执。该线程不是 paho 回调线程，
+  // 因此内部的 publish() 调用是安全的（paho 禁止在回调线程内调用 client API）。
+  void cmdLoop() {
+    while (!quit_) {
+      std::string plain;
+      {
+        std::unique_lock<std::mutex> lk(cmdMu_);
+        cmdCv_.wait_for(lk, std::chrono::seconds(1),
+                        [this]() { return quit_ || !commandQ_.empty(); });
+        if (quit_) break;
+        if (commandQ_.empty()) continue;
+        plain = std::move(commandQ_.front());
+        commandQ_.pop();
+      }
+      MqttCfg c;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        c = cfg_;
+      }
+      executeCommand(c, plain);
+    }
+  }
+
   // 收到明文消息：取 msg 字段当命令执行，结果加密回执到 <topic>/reply
   void executeCommand(const MqttCfg& c, const std::string& plain) {
+   try {
     nlohmann::json src = nlohmann::json::parse(plain, nullptr, false);
     if (src.is_discarded()) {
       mlog("[mqtt] 消息不是合法 JSON\n");
@@ -345,6 +421,11 @@ private:
     } catch (const std::exception& ex) {
       mlog("[mqtt] 回执失败: %s\n", ex.what());
     }
+   } catch (const std::exception& e) {
+    mlog("[mqtt] executeCommand 异常: %s\n", e.what());
+   } catch (...) {
+    mlog("[mqtt] executeCommand 未知异常\n");
+   }
   }
 };
 

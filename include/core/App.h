@@ -41,6 +41,10 @@ public:
   // 释放资源：关闭插件、HTTP 服务、托盘。
   void quit();
 
+  // 异步请求退出：在独立线程执行 quit()，避免阻塞托盘消息循环
+  //（插件关闭可能耗时，如 mqtt 需等待连接超时），导致右键菜单卡死。
+  void requestQuit();
+
   bool quitting() const { return quitting_.load(); }
 
   // HTTP / Tray 转发辅助
