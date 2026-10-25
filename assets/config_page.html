@@ -165,7 +165,10 @@ function renderPlugins(sc, config){
   });
 }
 function renderField(name,f,bucket){
-  var wrap=document.createElement('div'); var label=document.createElement('label'); label.textContent=f.label; wrap.appendChild(label);
+  var wrap=document.createElement('div'); var label=document.createElement('label');
+  label.textContent=f.label;
+  if(f.required){ var star=document.createElement('span'); star.textContent=' *'; star.style.color='var(--red)'; star.style.fontWeight='700'; label.appendChild(star); }
+  wrap.appendChild(label);
   // 数组字段：渲染为可增删行的表格（每行一个对象）
   if(f.type==='array'){
     var cols=f.fields||[], cid='a_'+name+'_'+f.key;
@@ -257,8 +260,26 @@ function updateBadge(s){
   if(s.last_success){ b.textContent='上次上报成功 '+t; b.className='badge ok'; }
   else { b.textContent='上次上报失败 '+t; b.className='badge err'; }
 }
+function validateRequired(sc){
+  var missing=[];
+  Object.keys(sc||{}).forEach(function(name){
+    var s=sc[name]; if(!s||!s.fields) return;
+    var cb=document.getElementById('en_'+name);
+    if(cb && !cb.checked) return;   // 已禁用插件不校验
+    (s.fields||[]).forEach(function(f){
+      if(!f.required) return;
+      if(f.type==='bool'||f.type==='array'||f.type==='select') return;  // 仅校验 text/number/password
+      var el=document.getElementById('f_'+name+'_'+f.key);
+      if(!el) return;
+      if((el.value||'').trim()==='') missing.push((s.title||name)+' · '+f.label);
+    });
+  });
+  return missing;
+}
 $('form').addEventListener('submit', function(e){
   e.preventDefault();
+  var missing=validateRequired(schemas);
+  if(missing.length){ toast('请填写必填项：'+missing.slice(0,3).join('、')+(missing.length>3?' 等':'')); return; }
   var data={ uuid:$('uuid').value, name:$('name').value, autostart:$('autostart').checked, http:{listen:$('http_listen').value}, plugins:collectPlugins(schemas,curCfg) };
   fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
     .then(function(r){ return r.json(); }).then(function(d){

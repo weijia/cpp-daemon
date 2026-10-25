@@ -87,7 +87,7 @@ std::string loadConfigPage() {
 }
 
 void toJson(const Field& f, nlohmann::json& j) {
-  j = {{"key", f.key}, {"label", f.label}, {"type", f.type}};
+  j = {{"key", f.key}, {"label", f.label}, {"type", f.type}, {"required", f.required}};
   if (!f.hint.empty()) j["hint"] = f.hint;
   if (!f.def.empty()) j["def"] = f.def;
   if (!f.options.empty()) j["options"] = f.options;

@@ -66,3 +66,4 @@ endif()
 add_subdirectory(src/plugins/reporter)   # RemoteStorage 上报
 add_subdirectory(src/plugins/mqtt)       # MQTT 远程命令
 add_subdirectory(src/plugins/scheduler)  # 定时任务（类 crontab）
+add_subdirectory(src/plugins/iot_report) # IoT 设备信息上报（MQTT 遥测）

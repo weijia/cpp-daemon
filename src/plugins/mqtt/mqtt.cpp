@@ -203,6 +203,8 @@ public:
     };
     for (auto& f : s.fields) {
       if (f.key == "broker") f.def = kDefaultBrokerDisplay;
+      // 必填：订阅主题与 AES 密钥缺失则远程命令收发不可用
+      if (f.key == "topic" || f.key == "secret") f.required = true;
     }
     return s;
   }

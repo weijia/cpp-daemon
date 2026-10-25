@@ -510,6 +510,10 @@ public:
         {"report.extra_info", "附带本机基础信息", "bool"},
         {"report.disk_info", "上报磁盘信息（每天一次）", "bool", "WMI 采集主机+物理/逻辑盘+分区映射，PUT ufs-nodes/{uuid}_disks.json"},
     };
+    for (auto& f : s.fields) {
+      // 必填：服务器地址与 Bearer Token 缺失则无法 PUT 上报
+      if (f.key == "remotestorage.server" || f.key == "remotestorage.token") f.required = true;
+    }
     return s;
   }
 
