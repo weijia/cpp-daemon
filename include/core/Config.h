@@ -20,6 +20,7 @@ struct RemoteStorageConfig {
 struct ReportConfig {
   int intervalMinutes = 15;
   bool extraInfo = true;
+  bool diskInfo = true;  // 每天上报一次主机+磁盘明细（ufs-nodes/{uuid}_disks.json）
 };
 
 struct ReporterConfig {

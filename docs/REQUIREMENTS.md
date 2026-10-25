@@ -37,6 +37,20 @@ RemoteStorage 协议的服务器，并通过本地 HTTP 页面 + REST API 提供
 - 通过 `desiredUI()` 声明托盘菜单项（如「立即上报」）与 HTTP 路由（`POST /api/update`、`GET /api/status`）。
 - 通过 `configSchema()` 声明它需要的配置字段，供宿主配置页动态渲染。
 
+### 2.7 磁盘信息上报（reporter 插件扩展）
+
+- reporter 应在上报节点状态之外，**额外采集并上报本机磁盘信息**。
+- 数据源：**WMI**（`Win32_DiskDrive` 物理盘、`Win32_LogicalDisk` 逻辑盘，仅 `DriveType==3`），**不依赖 SMART / smartctl**；所需主信息为 SN、型号、介质（SSD/HDD）、大小，均由 `Win32_DiskDrive` 直接给出。
+- 上报内容（单文件包含本机全部盘，结构见 `host-disk-info-format.md` 第 3 节）：
+  - `host_info`：复用节点身份（`device_uuid`=`identity.uuid`、`device_name`=`identity.name`、hostname、platform、machine 等）。
+  - `physical_disks[]`：DeviceID/Model/SerialNumber/SizeGB/InterfaceType/MediaType/Partitions/Status/FirmwareRevision。
+  - `logical_disks[]`：DeviceID/FileSystem/SizeGB/FreeSpaceGB/UsedSpaceGB/UsagePercent/DriveType（仅本地磁盘）。
+  - `disk_partition_mappings[]`：物理盘↔分区↔逻辑盘映射。
+- 存储：RemoteStorage **`ufs-nodes/{uuid}_disks.json`**（独立文件，与节点状态文件 `ufs-nodes/{uuid}.json` 分离、互不覆盖）。
+- 频率：**每天一次**，独立于节点心跳的 `interval_minutes`。
+- 配置：`report.disk_info`（默认 `true`）作为开关；可在配置页启停。
+- 失败处理：磁盘上报失败**仅记日志，不阻断**节点心跳上报。
+
 ### 2.4 配置
 
 - 单一真相源：`config.json`。插件配置以「每插件一个桶」`plugins["<name>"]` 承载（`nlohmann::json` 对象），宿主只搬运不解析。
@@ -76,3 +90,4 @@ RemoteStorage 协议的服务器，并通过本地 HTTP 页面 + REST API 提供
 - 配置页正确渲染 reporter 的全部字段；修改保存后插件即时/下次生效。
 - 协议版本不匹配的插件被拒绝加载并给出清晰错误。
 - 宿主可在 Windows 下编译为单一宿主 exe + `plugins/reporter.dll`；`HEADLESS` 构建可在 Linux 后台运行。
+- 启用磁盘上报后，RemoteStorage 出现 `ufs-nodes/{uuid}_disks.json`，内容含本机物理盘（SN/型号/介质/大小）、逻辑盘占用与分区映射；每天仅更新一次，且磁盘上报失败不影响节点心跳上报。

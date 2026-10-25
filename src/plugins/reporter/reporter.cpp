@@ -24,7 +24,10 @@
 #include <iphlpapi.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <wbemidl.h>
 #endif
+
+#include <cmath>
 
 // 插件自包含：复刻宿主 Config.cpp 的配置解析与 URL 工具。
 // 依据 Plugin.h 约定，宿主与插件互不 link，故插件需自带这些小工具。
@@ -44,6 +47,7 @@ ReporterConfig reporterFromJson(const nlohmann::json& j) {
     auto& rp = j["report"];
     c.report.intervalMinutes = rp.value("interval_minutes", 15);
     c.report.extraInfo = rp.value("extra_info", true);
+    c.report.diskInfo = rp.value("disk_info", true);
   }
   return c;
 }
@@ -195,6 +199,199 @@ static void rlog(const char* fmt, ...) {
   va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
 }
 
+// ---------- 磁盘明细采集（Windows WMI） ----------
+// 数据格式对齐 host-disk-info-format.md 第 3 节：
+//   host_info + physical_disks + logical_disks + disk_partition_mappings
+#ifdef _WIN32
+
+std::string wTrim(const std::string& s) {
+  size_t a = s.find_first_not_of(" \t\r\n");
+  if (a == std::string::npos) return "";
+  size_t b = s.find_last_not_of(" \t\r\n");
+  return s.substr(a, b - a + 1);
+}
+
+std::wstring toW(const std::string& s) {
+  if (s.empty()) return std::wstring();
+  int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+  std::wstring w(n, L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+  return w;
+}
+
+std::string toUtf8(const wchar_t* w, int len = -1) {
+  if (!w) return "";
+  int n = WideCharToMultiByte(CP_UTF8, 0, w, len, nullptr, 0, nullptr, nullptr);
+  if (n <= 0) return "";
+  std::string s(n, '\0');
+  WideCharToMultiByte(CP_UTF8, 0, w, len, &s[0], n, nullptr, nullptr);
+  if (len < 0 && !s.empty() && s.back() == '\0') s.pop_back();
+  return s;
+}
+
+double round2(double v) { return std::round(v * 100.0) / 100.0; }
+
+struct PhysDisk {
+  std::string deviceID, caption, model, serialNumber, interfaceType, mediaType, status, firmwareRevision;
+  double sizeGB = 0.0;
+  long partitions = 0;
+};
+struct LogDisk {
+  std::string deviceID, volumeName, fileSystem;
+  double sizeGB = 0.0, freeSpaceGB = 0.0;
+  long driveType = 0;
+};
+struct DiskMap {
+  std::string physicalDisk, physicalDiskModel, physicalDiskSerial, partition, logicalDisk, volumeName;
+};
+struct HostDisks {
+  std::string hostname, platform, platformVersion, machine, serialNumber;
+  std::vector<PhysDisk> phys;
+  std::vector<LogDisk> logs;
+  std::vector<DiskMap> maps;
+};
+
+// COM/WMI 会话 RAII：进入时 CoInitializeEx + ConnectServer，离开时释放接口与 CoUninitialize。
+struct WmiSession {
+  IWbemLocator* loc = nullptr;
+  IWbemServices* svc = nullptr;
+  bool comInited = false;
+  bool ok = false;
+  WmiSession() {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (hr == RPC_E_CHANGED_MODE) {
+      // 已被本进程初始化为别的模式：仍可用，但不负责 CoUninitialize。
+      comInited = false;
+    } else if (FAILED(hr)) {
+      return;
+    } else {
+      comInited = true;
+    }
+    // 安全性：可能已被进程设置过（返回 RPC_E_TOO_LATE），忽略。
+    CoInitializeSecurity(nullptr, -1, nullptr, nullptr,
+                         RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
+                         nullptr, EOAC_NONE, nullptr);
+    hr = CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER,
+                          IID_IWbemLocator, reinterpret_cast<LPVOID*>(&loc));
+    if (FAILED(hr) || !loc) return;
+    BSTR ns = SysAllocString(L"ROOT\\CIMV2");
+    hr = loc->ConnectServer(ns, nullptr, nullptr, nullptr, 0, nullptr, nullptr, &svc);
+    SysFreeString(ns);
+    if (FAILED(hr) || !svc) return;
+    CoSetProxyBlanket(svc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr,
+                      RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+                      nullptr, EOAC_NONE);
+    ok = true;
+  }
+  ~WmiSession() {
+    if (svc) svc->Release();
+    if (loc) loc->Release();
+    if (comInited) CoUninitialize();
+  }
+  WmiSession(const WmiSession&) = delete;
+  WmiSession& operator=(const WmiSession&) = delete;
+};
+
+std::string wmiStr(IWbemClassObject* o, const wchar_t* prop) {
+  VARIANT v; VariantInit(&v);
+  HRESULT hr = o->Get(prop, 0, &v, nullptr, nullptr);
+  std::string out;
+  if (SUCCEEDED(hr) && v.vt == VT_BSTR && v.bstrVal) out = toUtf8(v.bstrVal);
+  VariantClear(&v);
+  return out;
+}
+
+long wmiLong(IWbemClassObject* o, const wchar_t* prop) {
+  VARIANT v; VariantInit(&v);
+  HRESULT hr = o->Get(prop, 0, &v, nullptr, nullptr);
+  long out = 0;
+  if (SUCCEEDED(hr)) {
+    if (v.vt == VT_I4) out = v.lVal;
+    else if (v.vt == VT_BSTR && v.bstrVal) {
+      try { out = std::stol(toUtf8(v.bstrVal)); } catch (...) {}
+    }
+  }
+  VariantClear(&v);
+  return out;
+}
+
+// WMI 把大容量字段以 VT_BSTR（十进制字符串）返回。
+double wmiBytesGB(IWbemClassObject* o, const wchar_t* prop) {
+  VARIANT v; VariantInit(&v);
+  HRESULT hr = o->Get(prop, 0, &v, nullptr, nullptr);
+  double bytes = 0.0;
+  if (SUCCEEDED(hr)) {
+    if (v.vt == VT_BSTR && v.bstrVal) {
+      try { bytes = std::stod(toUtf8(v.bstrVal)); } catch (...) {}
+    } else if (v.vt == VT_I4) {
+      bytes = static_cast<double>(v.lVal);
+    }
+  }
+  VariantClear(&v);
+  return bytes / (1024.0 * 1024.0 * 1024.0);
+}
+
+std::vector<IWbemClassObject*> wmiQuery(IWbemServices* svc, const wchar_t* wql) {
+  std::vector<IWbemClassObject*> out;
+  BSTR lang = SysAllocString(L"WQL");
+  BSTR q = SysAllocString(wql);
+  IEnumWbemClassObject* en = nullptr;
+  HRESULT hr = svc->ExecQuery(lang, q,
+                              WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+                              nullptr, &en);
+  SysFreeString(lang);
+  SysFreeString(q);
+  if (FAILED(hr) || !en) return out;
+  IWbemClassObject* obj = nullptr;
+  ULONG ret = 0;
+  while (en->Next(WBEM_INFINITE, 1, &obj, &ret) == S_OK && ret == 1 && obj) {
+    out.push_back(obj);
+    obj = nullptr;
+  }
+  en->Release();
+  return out;
+}
+
+// 从 WMI 对象路径中提取 key="value" 中的 value（UTF-8）。
+// 形如：\\HOST\root\cimv2:Win32_DiskPartition.DiskIndex="0",Index="1"
+std::string wmiObjPathKey(const std::wstring& path, const std::wstring& key) {
+  std::wstring pat = key + L"=\"";
+  size_t pos = path.find(pat);
+  if (pos == std::wstring::npos) return "";
+  pos += pat.size();
+  size_t end = path.find(L'"', pos);
+  if (end == std::wstring::npos) return "";
+  return toUtf8(path.substr(pos, end - pos).c_str());
+}
+
+// WMI 对象路径里反斜杠被转义为 "\\"，还原为单个 "\"。
+std::string wmiUnescape(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '\\' && i + 1 < s.size() && s[i + 1] == '\\') {
+      out.push_back('\\');
+      ++i;
+    } else {
+      out.push_back(s[i]);
+    }
+  }
+  return out;
+}
+
+std::string machineArch() {
+  SYSTEM_INFO si;
+  GetNativeSystemInfo(&si);
+  switch (si.wProcessorArchitecture) {
+    case PROCESSOR_ARCHITECTURE_AMD64: return "AMD64";
+    case PROCESSOR_ARCHITECTURE_ARM64: return "ARM64";
+    case PROCESSOR_ARCHITECTURE_INTEL: return "x86";
+    default: return "Unknown";
+  }
+}
+
+#endif  // _WIN32
+
 }  // namespace
 
 namespace reporter {
@@ -311,6 +508,7 @@ public:
         {"remotestorage.proxy", "代理 Proxy（可选）", "text", "公司网络需填写，如 http://proxy:8080；留空则自动读取系统代理环境变量"},
         {"report.interval_minutes", "上报间隔（分钟）", "number"},
         {"report.extra_info", "附带本机基础信息", "bool"},
+        {"report.disk_info", "上报磁盘信息（每天一次）", "bool", "WMI 采集主机+物理/逻辑盘+分区映射，PUT ufs-nodes/{uuid}_disks.json"},
     };
     return s;
   }
@@ -324,6 +522,15 @@ public:
       resp.body = j.dump();
     } else if (req.path == "/api/status") {
       nlohmann::json j = {{"status", stateSnapshot()}};
+      {
+        std::lock_guard<std::mutex> lk(diskMu_);
+        j["disk"] = {
+          {"last_upload", lastDiskUpload_},
+          {"physical_count", lastDiskPhysCount_},
+          {"logical_count", lastDiskLogCount_},
+          {"error", lastDiskError_}
+        };
+      }
       resp.body = j.dump();
     } else {
       resp.statusCode = 404;
@@ -358,6 +565,14 @@ private:
   std::string lastError_;
 
   std::map<std::string, int64_t> executed_;  // cmdId -> 已执行时间戳
+
+  // 磁盘明细上报状态（独立于节点心跳，24h 一次）
+  std::mutex diskMu_;
+  std::chrono::steady_clock::time_point lastDiskSuccess_{};  // epoch -> 首次即触发
+  std::string lastDiskUpload_;        // 上次成功上报的本地 ISO 时间
+  std::string lastDiskError_;         // 上次失败原因
+  int lastDiskPhysCount_ = 0;
+  int lastDiskLogCount_ = 0;
 
   std::string targetURL() {
     std::lock_guard<std::mutex> lk(mu_);
@@ -402,6 +617,7 @@ private:
 
   void reportLoop() {
     uploadUntilOK();
+    maybeUploadDisk();  // 启动后先尝试一次磁盘明细上报（24h 节流在内部判断）
     auto next = std::chrono::steady_clock::now() + std::chrono::minutes(intervalMin());
     while (!quit_) {
       {
@@ -411,6 +627,7 @@ private:
       if (quit_) break;
       uploadUntilOK();
       next = std::chrono::steady_clock::now() + std::chrono::minutes(intervalMin());
+      maybeUploadDisk();  // 磁盘明细独立于心跳，失败只记日志
     }
   }
 
@@ -691,6 +908,278 @@ private:
 #else
     return {};
 #endif
+  }
+
+  // 本地时间 ISO，微秒精度：2024-07-02T12:09:03.123456（对齐格式文档 §3 示例）
+  std::string nowISOLocalMicros() {
+    using namespace std::chrono;
+    auto now = system_clock::now();
+    auto t = system_clock::to_time_t(now);
+    auto us = duration_cast<microseconds>(now.time_since_epoch()) % 1000000;
+    std::tm tm{};
+    localtime_s(&tm, &t);
+    char buf[40];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
+    std::string out(buf);
+    char tail[16];
+    std::snprintf(tail, sizeof(tail), ".%06d", (int)us.count());
+    out += tail;
+    return out;
+  }
+
+  // 采集主机+磁盘明细（Windows WMI）。失败时 err 非空并返回 false。
+  bool collectHostDisks(HostDisks& hd, std::string& err) {
+#ifdef _WIN32
+    WmiSession wmi;
+    if (!wmi.ok) {
+      err = "WMI 会话初始化失败（CoCreateInstance/ConnectServer）";
+      return false;
+    }
+    // host_info
+    char h[256] = {0};
+    DWORD hn = sizeof(h);
+    GetComputerNameA(h, &hn);
+    hd.hostname = h;
+    hd.platform = "Windows";
+    hd.machine = machineArch();
+
+    // Win32_OperatingSystem.Version -> platform_version；Win32_BIOS.SerialNumber -> serial_number
+    for (auto* o : wmiQuery(wmi.svc, L"SELECT Version FROM Win32_OperatingSystem")) {
+      hd.platformVersion = wTrim(wmiStr(o, L"Version"));
+      o->Release();
+      break;
+    }
+    for (auto* o : wmiQuery(wmi.svc, L"SELECT SerialNumber FROM Win32_BIOS")) {
+      hd.serialNumber = wTrim(wmiStr(o, L"SerialNumber"));
+      o->Release();
+      break;
+    }
+
+    // 物理盘 Win32_DiskDrive
+    std::map<std::string, size_t> physIdx;
+    for (auto* o : wmiQuery(wmi.svc,
+          L"SELECT DeviceID,Caption,Model,SerialNumber,Size,InterfaceType,MediaType,Partitions,Status,FirmwareRevision FROM Win32_DiskDrive")) {
+      PhysDisk d;
+      d.deviceID = wTrim(wmiStr(o, L"DeviceID"));
+      d.caption = wTrim(wmiStr(o, L"Caption"));
+      d.model = wTrim(wmiStr(o, L"Model"));
+      d.serialNumber = wTrim(wmiStr(o, L"SerialNumber"));
+      d.sizeGB = wmiBytesGB(o, L"Size");
+      d.interfaceType = wTrim(wmiStr(o, L"InterfaceType"));
+      d.mediaType = wTrim(wmiStr(o, L"MediaType"));
+      d.partitions = wmiLong(o, L"Partitions");
+      d.status = wTrim(wmiStr(o, L"Status"));
+      d.firmwareRevision = wTrim(wmiStr(o, L"FirmwareRevision"));
+      if (!d.deviceID.empty()) {
+        physIdx[d.deviceID] = hd.phys.size();
+        hd.phys.push_back(std::move(d));
+      }
+      o->Release();
+    }
+
+    // 逻辑盘 Win32_LogicalDisk（仅 DriveType==3 本地磁盘）
+    std::map<std::string, size_t> logIdx;
+    for (auto* o : wmiQuery(wmi.svc,
+          L"SELECT DeviceID,VolumeName,FileSystem,Size,FreeSpace,DriveType FROM Win32_LogicalDisk WHERE DriveType=3")) {
+      LogDisk d;
+      d.deviceID = wTrim(wmiStr(o, L"DeviceID"));
+      d.volumeName = wTrim(wmiStr(o, L"VolumeName"));
+      d.fileSystem = wTrim(wmiStr(o, L"FileSystem"));
+      d.sizeGB = wmiBytesGB(o, L"Size");
+      d.freeSpaceGB = wmiBytesGB(o, L"FreeSpace");
+      d.driveType = wmiLong(o, L"DriveType");
+      if (!d.deviceID.empty()) {
+        logIdx[d.deviceID] = hd.logs.size();
+        hd.logs.push_back(std::move(d));
+      }
+      o->Release();
+    }
+
+    // 分区映射：partitionLabel("Disk #0, Partition #1") -> 物理盘 DeviceID
+    // WMI 关联对象路径形如：
+    //   Win32_DiskDrive.DeviceID="\\\\.\\PHYSICALDRIVE0"
+    //   Win32_DiskPartition.DeviceID="Disk #0, Partition #1"
+    std::map<std::string, std::string> partToPhys;
+    for (auto* o : wmiQuery(wmi.svc,
+          L"SELECT Antecedent,Dependent FROM Win32_DiskDriveToDiskPartition")) {
+      std::string ante = wmiUnescape(wTrim(wmiStr(o, L"Antecedent")));
+      std::string dep = wTrim(wmiStr(o, L"Dependent"));
+      std::string physDev = wTrim(wmiObjPathKey(toW(ante), L"DeviceID"));
+      std::string partLabel = wTrim(wmiObjPathKey(toW(dep), L"DeviceID"));
+      if (!partLabel.empty()) partToPhys[partLabel] = physDev;
+      o->Release();
+    }
+    // LogicalDisk -> Partition
+    for (auto* o : wmiQuery(wmi.svc,
+          L"SELECT Antecedent,Dependent FROM Win32_LogicalDiskToPartition")) {
+      std::string ante = wTrim(wmiStr(o, L"Antecedent"));
+      std::string dep = wmiUnescape(wTrim(wmiStr(o, L"Dependent")));
+      std::string partLabel = wTrim(wmiObjPathKey(toW(ante), L"DeviceID"));
+      std::string logDev = wTrim(wmiObjPathKey(toW(dep), L"DeviceID"));
+      auto it = partToPhys.find(partLabel);
+      if (it != partToPhys.end()) {
+        DiskMap m;
+        m.physicalDisk = it->second;
+        auto pit = physIdx.find(m.physicalDisk);
+        if (pit != physIdx.end()) {
+          m.physicalDiskModel = hd.phys[pit->second].model;
+          m.physicalDiskSerial = hd.phys[pit->second].serialNumber;
+        }
+        m.partition = partLabel;
+        m.logicalDisk = logDev;
+        auto lit = logIdx.find(logDev);
+        if (lit != logIdx.end()) m.volumeName = hd.logs[lit->second].volumeName;
+        hd.maps.push_back(std::move(m));
+      }
+      o->Release();
+    }
+    return true;
+#else
+    err = "磁盘明细采集仅支持 Windows";
+    return false;
+#endif
+  }
+
+  nlohmann::json buildDiskPayload(const HostDisks& hd) {
+    std::string now = nowISOLocalMicros();
+    nlohmann::json j;
+    j["host_info"] = {
+      {"device_uuid", identity_.uuid},
+      {"device_name", identity_.name},
+      {"hostname", hd.hostname},
+      {"platform", hd.platform},
+      {"platform_version", hd.platformVersion},
+      {"machine", hd.machine},
+      {"serial_number", hd.serialNumber}
+    };
+    j["collection_time"] = now;
+    j["last_updated"] = now;
+    nlohmann::json pd = nlohmann::json::array();
+    for (const auto& d : hd.phys) {
+      pd.push_back({
+        {"DeviceID", d.deviceID},
+        {"Caption", d.caption},
+        {"Model", d.model},
+        {"SerialNumber", d.serialNumber},
+        {"SizeGB", round2(d.sizeGB)},
+        {"InterfaceType", d.interfaceType},
+        {"MediaType", d.mediaType},
+        {"Partitions", d.partitions},
+        {"Status", d.status},
+        {"FirmwareRevision", d.firmwareRevision}
+      });
+    }
+    j["physical_disks"] = pd;
+    nlohmann::json ld = nlohmann::json::array();
+    for (const auto& d : hd.logs) {
+      double used = d.sizeGB - d.freeSpaceGB;
+      double pct = d.sizeGB > 0.0 ? used / d.sizeGB * 100.0 : 0.0;
+      ld.push_back({
+        {"DeviceID", d.deviceID},
+        {"VolumeName", d.volumeName},
+        {"FileSystem", d.fileSystem},
+        {"SizeGB", round2(d.sizeGB)},
+        {"FreeSpaceGB", round2(d.freeSpaceGB)},
+        {"UsedSpaceGB", round2(used)},
+        {"UsagePercent", round2(pct)},
+        {"DriveType", d.driveType}
+      });
+    }
+    j["logical_disks"] = ld;
+    nlohmann::json mp = nlohmann::json::array();
+    for (const auto& m : hd.maps) {
+      mp.push_back({
+        {"PhysicalDisk", m.physicalDisk},
+        {"PhysicalDiskModel", m.physicalDiskModel},
+        {"PhysicalDiskSerial", m.physicalDiskSerial},
+        {"Partition", m.partition},
+        {"LogicalDisk", m.logicalDisk},
+        {"VolumeName", m.volumeName}
+      });
+    }
+    j["disk_partition_mappings"] = mp;
+    return j;
+  }
+
+  // PUT ufs-nodes/{uuid}_disks.json，复用 remotestorage server/token/代理。
+  bool uploadDisk(std::string& err) {
+    HostDisks hd;
+    if (!collectHostDisks(hd, err)) {
+      err = "采集失败: " + err;
+      return false;
+    }
+    nlohmann::json payload = buildDiskPayload(hd);
+    std::string body = payload.dump();
+
+    std::string url;
+    std::string proxyCfg;
+    std::string token;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      std::string base = cfg_.remotestorage.server;
+      while (!base.empty() && base.back() == '/') base.pop_back();
+      url = base + "/ufs-nodes/" + identity_.uuid + "_disks.json";
+      proxyCfg = cfg_.remotestorage.proxy;
+      token = cfg_.remotestorage.token;
+    }
+    std::string base, path;
+    splitURL(url, base, path);
+    if (base.empty()) {
+      err = "remotestorage.server 未配置";
+      return false;
+    }
+    httplib::Client cli(base);
+    cli.enable_server_certificate_verification(true);
+    std::string proxy = proxyCfg.empty() ? envProxy() : proxyCfg;
+    std::string ph; int pp = 0;
+    if (!proxy.empty() && parseProxy(proxy, ph, pp)) cli.set_proxy(ph, pp);
+
+    httplib::Headers hdr;
+    if (!token.empty()) hdr.emplace("Authorization", "Bearer " + token);
+    auto pres = cli.Put(path, hdr, body, "application/json");
+    if (!pres) {
+      err = "network: PUT 失败: " + httpErr(pres);
+      return false;
+    }
+    if (pres->status < 200 || pres->status >= 300) {
+      err = (pres->status == 401 || pres->status == 403 ? "auth: " : "server: ")
+            + std::to_string(pres->status);
+      return false;
+    }
+    {
+      std::lock_guard<std::mutex> lk(diskMu_);
+      lastDiskSuccess_ = std::chrono::steady_clock::now();
+      lastDiskUpload_ = nowISOLocalMicros();
+      lastDiskError_.clear();
+      lastDiskPhysCount_ = (int)hd.phys.size();
+      lastDiskLogCount_ = (int)hd.logs.size();
+    }
+    rlog("[reporter] 磁盘明细上报成功 path=%s phys=%zu log=%zu\n",
+         path.c_str(), hd.phys.size(), hd.logs.size());
+    return true;
+  }
+
+  // 心跳周期内调用：满 24h 才上报磁盘明细；失败只记日志，不影响心跳。
+  void maybeUploadDisk() {
+    bool enabled = false;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      enabled = cfg_.report.diskInfo;
+    }
+    if (!enabled) return;
+    auto now = std::chrono::steady_clock::now();
+    {
+      std::lock_guard<std::mutex> lk(diskMu_);
+      if (lastDiskSuccess_.time_since_epoch().count() != 0 &&
+          now - lastDiskSuccess_ < std::chrono::hours(24))
+        return;
+    }
+    std::string err;
+    if (!uploadDisk(err)) {
+      std::lock_guard<std::mutex> lk(diskMu_);
+      lastDiskError_ = err;
+      rlog("[reporter] 磁盘明细上报失败: %s\n", err.c_str());
+    }
   }
 
 };

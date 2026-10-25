@@ -10,6 +10,9 @@ target_link_libraries(reporter PRIVATE
   nlohmann_json::nlohmann_json
   httplib::httplib
   $<$<PLATFORM_ID:Windows>:iphlpapi>
+  $<$<PLATFORM_ID:Windows>:wbemuuid>
+  $<$<PLATFORM_ID:Windows>:ole32>
+  $<$<PLATFORM_ID:Windows>:oleaut32>
 )
 
 # 与宿主同动态 CRT，保证跨 DLL ABI 稳定

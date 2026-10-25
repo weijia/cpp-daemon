@@ -142,3 +142,62 @@ Linux headless：`conan install . ... -s compiler.libcxx=libstdc++11` 后加 `-D
 4. 插件崩溃隔离：未来若插件来源不可全信，可回退到子进程 + IPC（与 go-daemon 同思路）。
 5. 插件签名/哈希校验：加载前校验二进制，防未授权插件。
 6. 远程配置下发（插件主动 Pull）。
+
+## 11. 磁盘信息上报（reporter 插件扩展）
+
+### 11.1 目标与边界
+
+在 `reporter` 插件内新增「主机磁盘信息上报」能力。**与节点状态心跳分文件、分频率**，互不干扰：
+
+| 数据 | 文件 | 频率 | 现状 |
+|------|------|------|------|
+| 节点状态心跳（格式文档 #1） | `ufs-nodes/{uuid}.json` | `interval_minutes`（默认 15 分钟） | 已有，不变 |
+| 主机磁盘信息（格式文档 #3） | `ufs-nodes/{uuid}_disks.json` | **每天一次** | 新增 |
+
+- 磁盘文件与节点状态文件**文件名后缀不同**（`_disks`），共存于 `ufs-nodes/`，互不覆盖（符合格式文档「两者共存」约定）。
+- 磁盘上报失败**仅记日志**，不阻断节点心跳上报（磁盘为附属信息）。
+
+### 11.2 数据源：纯 WMI，不依赖 SMART
+
+磁盘主信息（SN、型号、介质、大小）均来自 WMI，**无需 SMART、无需 smartctl**：
+
+- `Win32_DiskDrive` → 物理盘：`SerialNumber`(SN)、`Model`(型号)、`MediaType`(介质：SSD/HDD/Fixed hard disk media)、`Size`(大小，字节→GB)、`InterfaceType`、`FirmwareRevision`、`Partitions`、`Status`。
+- `Win32_LogicalDisk`（仅 `DriveType==3` 本地磁盘）→ 逻辑盘：`DeviceID`(盘符)、`FileSystem`、`Size`、`FreeSpace`、`UsagePercent`。
+- 分区映射：通过 `Win32_DiskDriveToDiskPartition` + `Win32_LogicalDiskToPartition` 关联得到「物理盘↔分区↔逻辑盘」。
+
+> 温度/健康等 SMART 遥测**不在本次范围**（用户明确只需要 SN/型号/介质/大小等主信息），故不引入 `MSFT_PhysicalDisk` 与 smartctl 依赖。
+
+### 11.3 上报结构与存储
+
+单文件包含本机全部盘，结构对齐格式文档 `host-disk-info-format.md` 第 3 节：
+
+```json
+{
+  "host_info": { "device_uuid": "...", "device_name": "...", "hostname": "...",
+                 "platform": "Windows", "platform_version": "...", "machine": "...", "serial_number": "..." },
+  "collection_time": "2026-10-24T...",
+  "last_updated": "2026-10-24T...",
+  "physical_disks": [ { "DeviceID": "...", "Model": "...", "SerialNumber": "...",
+                        "SizeGB": 931.51, "InterfaceType": "SCSI", "MediaType": "SSD",
+                        "Partitions": 4, "Status": "OK", "FirmwareRevision": "..." } ],
+  "logical_disks": [ { "DeviceID": "C:", "FileSystem": "NTFS", "SizeGB": 930.5,
+                       "FreeSpaceGB": 420.3, "UsedSpaceGB": 510.2, "UsagePercent": 54.83, "DriveType": 3 } ],
+  "disk_partition_mappings": [ { "PhysicalDisk": "...", "LogicalDisk": "C:", "VolumeName": "..." } ]
+}
+```
+
+- `host_info.device_uuid` = `identity_.uuid`，`device_name` = `identity_.name`；`hostname`/`platform`/`machine` 等同心跳采集逻辑。
+- 路径默认 `/ufs-nodes/{uuid}_disks.json`，复用 `resolveURL` 的 `{uuid}` 占位（或新增磁盘路径模板），复用现有 `cli`/`token`/代理逻辑。
+
+### 11.4 实现要点
+
+- **定时器**：在 `reportLoop` 内另记 `lastDiskUpload` 时间戳，每天（24h）触发一次磁盘 PUT；与心跳循环共用一个线程，独立时间判断。
+- **采集**：新增 `collectHostDisks()`（COM 初始化 + WMI 查询，返回聚合结构）、`buildDiskPayload()`（组装上述 JSON）、`uploadDisk()`（PUT 到磁盘文件）。
+- **配置**：`ReportConfig` 加 `bool diskInfo = true;`（开关）；`reporterFromJson` 读取 `report.disk_info`；`configSchema()` 加「上报磁盘信息」bool 项。
+- **可观测**：`desiredUI()` 的 `GET /api/status` 增加返回「上次磁盘上报时间 / 磁盘计数」，便于验证。
+- **构建**：`plugins/reporter/CMakeLists.txt` 需链接 `Wbemuuid.lib`（WMI 必需）；源文件已含 `<windows.h>` 等 Windows 头。
+
+### 11.5 参考
+
+- 数据格式：`my-data/docs/formats/host-disk-info-format.md`（第 1、3 节）。
+- 节点状态上报与 inbox 逻辑见 §6 及 `reporter.cpp` 的 `sync()`。
