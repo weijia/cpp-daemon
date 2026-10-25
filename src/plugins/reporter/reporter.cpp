@@ -678,6 +678,10 @@ private:
     rlog("[reporter] 同步 GET base=%s path=%s\n", base.c_str(), path.c_str());
     httplib::Client cli(base);
     cli.enable_server_certificate_verification(true);
+    // 限制每次请求最长阻塞时间，避免退出时 reportThread 卡在 GET/PUT 上导致 join 永不返回
+    cli.set_connection_timeout(10, 0);
+    cli.set_read_timeout(15, 0);
+    cli.set_write_timeout(10, 0);
     // 可选代理（公司网络常见需要）
     std::string ph; int pp = 0;
     std::string proxy = c.remotestorage.proxy;

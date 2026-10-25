@@ -60,12 +60,18 @@
 - [x] 实测：/api/config 返回 required=true 字段清单正确（iot_report 6 项、mqtt 2 项、reporter 2 项）；配置页 200；服务端下发 HTML 含红星渲染与校验代码；验证后已清理 daemon 进程
 - [x] 空必填拦截：前端 JS 静态断言（validateRequired 在 fetch POST 前 return），未做浏览器交互实测
 
-## [x] 托盘右键退出修复（图标 NIM_DELETE + 进程真正退出 + 实测）
+## [x] 托盘右键退出修复（NIM_DELETE + 进程真正退出 + 压测验证）
 
-现象：托盘右键「退出」后图标残留、`Get-Process cpp-daemon` 仍在。退出链路为 托盘 WM_COMMAND kIdmQuit → `App::requestQuit()`（独立线程跑 `quit()`）→ stopConfigWatch → `PluginManager::shutdownAll`（字典序 iot_report→mqtt→reporter）→ http_->shutdown → `tray_->quit()`（PostMessage WM_APP+1）→ 消息循环退出后 `Shell_NotifyIcon(NIM_DELETE)`。
+现象：托盘右键「退出」后图标残留、`Get-Process cpp-daemon` 仍在、9801 仍监听（http_->shutdown() 未执行到）。退出链路：托盘 WM_COMMAND kIdmQuit → `App::requestQuit()`（detached 线程跑 `quit()`）→ stopConfigWatch → `PluginManager::shutdownAll()`（字典序 iot_report→mqtt→reporter）→ http_->shutdown → `tray_->quit()`（PostMessage WM_APP+1）→ 消息循环 break 后 `Shell_NotifyIcon(NIM_DELETE)`。
 
-- [x] 根因定位（临时 stderr/文件打点 quit_trace.log 实测）：卡死在 `iot_report::shutdown()` 的 `thread_.join()`。iot_report 原 loop 收尾在**持有 `cliMu_`** 的状态下调用 `disconnect()->wait()`，与 paho 内部网络线程争锁，使 shutdown 的 join 长时间不返回；`tray_->quit()` 因此永不执行 → WM_APP+1 不投递 → NIM_DELETE 不调用 → 图标残留 + 进程存活。仅在 iot_report 连 TLS broker 并完成至少一次真实发布后触发（时序相关），故 8s 内退出干净、跑满一个发布周期后必现
-- [x] 对齐 mqtt 可靠退出路径：`src/plugins/iot_report/iot_report.cpp` loop 收尾改为与 mqtt 插件一致——`disconnect()->wait()` 移到 `cliMu_` 锁外执行，再在锁内 `cli_.reset()`；shutdown() 本身已与 mqtt 同构（fire disconnect → join → 防御性 reset），未动。未回退 iot_report 任何上报行为，仅改拆毁段的加锁范围
-- [x] 编译验证：单 cmd vcvarsall x64 + uvx conan install + cmake preset 流程，0 error；cpp-daemon.exe 与 iot_report/mqtt/reporter/scheduler 各 dll 正常产出，既有插件行为不变
-- [x] 实测：启动最终二进制 → 等待 ≥70s 让 iot_report 真实发布一次 → 触发退出，连跑 3 轮均在 ~2–4s 内进程消失（Get-Process 为空）。触发途径为临时 `/api/quit`，其调用与托盘右键「退出」**同一条** `App::requestQuit()`（托盘 WM_COMMAND kIdmQuit → `app_->requestQuit()`）；验证后已移除该临时路由，最终产物不含调试接口
-- [x] 托盘图标断言：进程退出即证明 `tray_->quit()`（WM_APP+1）已执行并走到消息循环后的 `Shell_NotifyIcon(NIM_DELETE)`（该调用在 Tray::run() 消息循环 break 后无条件执行，无竞态）。Win11 托盘 flyout/P-Invoke 右键自动化未稳定跑通（提升区/溢出区/UIPI），以「同路径 requestQuit 实测 3/3 + NIM_DELETE 代码级论证」交付
+- [x] 根因（打点 quit_trace.log + 卡死现场 minidump 交叉确认）：卡在 `plugins_->shutdownAll()`。iot_report 连真实 TLS broker（120.48.27.188:8883），paho 的 `connect(conn)->wait()` 与 loop 收尾 `disconnect()->wait()` 均为**无超时**无限等待；且 loop 收尾 disconnect 与 shutdown 的 disconnect **双重调用**，在 quit 与发布循环竞态窗口内（打点 fopen 改变时序即可绕过，故第一轮"锁外 disconnect"在带打点构建里 3/3、真实干净二进制仍挂），`thread_.join()` 长卡 → tray_->quit() 永不执行 → NIM_DELETE 不调用 → 图标残留 + 进程存活。reporter 的 httplib GET/PUT 未设超时，quit 时 reportThread 可能阻塞在请求上
+- [x] 修复（对齐 mqtt 可靠拆毁 + 有限超时，消除所有无限等待）：
+  - `iot_report.cpp`：connect()->wait() → wait_for(15s)；loop 收尾 disconnect()->wait() → wait_for(5s)；shutdown 防御性 disconnect()->wait() → wait_for(5s)。保留第一轮"disconnect wait 在 cliMu_ 锁外"改动
+  - `mqtt.cpp`：connect wait_for(15s)、subscribe wait_for(10s)、loop 与 shutdown 的 disconnect wait_for(5s)（同模式加固，TCP broker 原本快但同隐患）
+  - `reporter.cpp`：主上传 httplib::Client 显式 set_connection_timeout(10s)/set_read_timeout(15s)/set_write_timeout(10s)，避免 reportThread 阻塞在 GET/PUT 上导致 join 不返回
+  - scheduler 在 config 中 disabled 不加载，未改
+- [x] 编译：单 cmd vcvarsall x64 + uvx conan install + cmake preset 流程，0 error；cpp-daemon.exe 与四插件 dll 正常产出
+- [x] 压测验证（带打点构建）：启动→等 75s 让 iot_report 真实发布→触发同路径 requestQuit，连跑 3 轮均 2–3s 内进程消失（Get-Process 为空）；打点 quit_trace.log 显示 quit 全链路（iot_report→mqtt→reporter→http→tray）逐段完成
+- [x] 最终产物：移除全部 tr()/rtr() 打点与临时 `/api/quit` 路由（git diff 仅剩 iot_report/mqtt/reporter 三个插件文件，App.cpp/PluginManager.cpp/HttpServer.cpp 已还原）
+- [x] 托盘图标断言：进程退出即证明 `tray_->quit()`（WM_APP+1）已执行并走到消息循环后的 `Shell_NotifyIcon(NIM_DELETE)`（该调用在 Tray::run() 消息循环 break 后无条件执行，无竞态）。Win11 托盘 flyout/提升区/UIPI 隔离下 P/Invoke 真实右键自动化未稳定跑通（中文 tooltip 编码 + 通知区窗口嵌套），以「同路径 requestQuit 压测 3/3 + NIM_DELETE 代码级论证」交付；托盘右键 WM_COMMAND kIdmQuit 与 /api/quit 调用同一 `App::requestQuit()`，路径一致
+- [x] 收尾轮 WM_COMMAND 同路径压测：最终二进制（exe 22:10 构建）上，按 pid 枚举定位 CppDaemonTrayClass 窗口 → PostMessage(WM_COMMAND, wparam=2/*kIdmQuit*/, 0)，即跳过鼠标菜单交互、但与「退出」菜单项**共用同一条 WndProc→requestQuit 分支**。连测 3 轮（启动→等 75s 真实发布→投递），退出耗时 7s/6s/7s，9801 均释放，无残留进程。**如实标注：WM_COMMAND 投递（非鼠标点击）**。真实鼠标右键自动化受 Win11 flyout/UIPI 限制未跑通；已沉淀 `tray_quit_verify.ps1` 供用户一键手动复核（启动→提示手动右键退出→自动轮询 60s 报耗时/兜底清理）

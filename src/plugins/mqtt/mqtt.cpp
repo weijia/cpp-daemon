@@ -175,7 +175,7 @@ public:
     std::lock_guard<std::mutex> lk(cliMu_);
     if (cli_) {
       try {
-        cli_->disconnect()->wait();
+        cli_->disconnect()->wait_for(std::chrono::seconds(5));
       } catch (...) {
       }
       cli_.reset();
@@ -271,7 +271,7 @@ private:
       std::lock_guard<std::mutex> lk(cliMu_);
       if (cli_) {
         try {
-          cli_->disconnect()->wait();
+          cli_->disconnect()->wait_for(std::chrono::seconds(5));
         } catch (...) {
         }
         cli_.reset();
@@ -349,11 +349,11 @@ private:
           raw = cli_.get();
         }
         if (raw) {
-          raw->connect(conn)->wait();
+          raw->connect(conn)->wait_for(std::chrono::seconds(15));
           // 订阅放在 loop 线程（非 paho 回调线程）执行：paho 禁止在回调里调用阻塞
           // API，否则会死锁内部锁，导致 is_connected()/disconnect() 全部卡死。
           try {
-            raw->subscribe(topic, 1)->wait();
+            raw->subscribe(topic, 1)->wait_for(std::chrono::seconds(10));
             mlog("[mqtt] 已连接并订阅 %s\n", topic.c_str());
           } catch (const std::exception& e) {
             mlog("[mqtt] 订阅失败: %s\n", e.what());
@@ -364,7 +364,7 @@ private:
       // 断开连接：wait 不在 cliMu_ 保护下进行，避免与 connection_lost 回调争锁死锁
       if (cli_) {
         try {
-          cli_->disconnect()->wait();
+          cli_->disconnect()->wait_for(std::chrono::seconds(5));
         } catch (...) {
         }
       }

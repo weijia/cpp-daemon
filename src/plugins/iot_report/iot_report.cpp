@@ -269,7 +269,7 @@ public:
     }
     if (thread_.joinable()) thread_.join();
     std::lock_guard<std::mutex> lk(cliMu_);
-    if (cli_) { try { cli_->disconnect()->wait(); } catch (...) {} cli_.reset(); }
+    if (cli_) { try { cli_->disconnect()->wait_for(std::chrono::seconds(5)); } catch (...) {} cli_.reset(); }
   }
 
   cppdaemon::DesiredUI desiredUI() const override {
@@ -602,7 +602,8 @@ private:
       }
       mqtt::async_client* raw = nullptr;
       { std::lock_guard<std::mutex> lk(cliMu_); raw = cli_.get(); }
-      raw->connect(conn)->wait();
+      // connect_timeout=10 已限制连接尝试；wait_for 给足余量，避免 quit 时无限阻塞
+      raw->connect(conn)->wait_for(std::chrono::seconds(15));
       connected_ = true;
       ilog("[iot_report] 已连接 MQTT topic=%s\n", topic.c_str());
       return true;
@@ -674,11 +675,9 @@ private:
         lastError_ = e.what();
       }
     }
-    // 断开连接：wait 不持 cliMu_（与 mqtt 插件一致）。
-    // 若在持锁状态下调用 disconnect()->wait()，会与 paho 内部网络线程争锁，
-    // 导致 shutdown() 的 thread_.join() 长时间卡死（表现为托盘退出后进程不退出）。
+    // 断开连接：wait 不持 cliMu_（与 mqtt 插件一致），且给有限超时避免 quit 时无限阻塞。
     if (cli_) {
-      try { cli_->disconnect()->wait(); } catch (...) {}
+      try { cli_->disconnect()->wait_for(std::chrono::seconds(5)); } catch (...) {}
     }
     {
       std::lock_guard<std::mutex> lk(cliMu_);
