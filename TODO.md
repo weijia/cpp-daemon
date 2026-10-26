@@ -75,3 +75,15 @@
 - [x] 最终产物：移除全部 tr()/rtr() 打点与临时 `/api/quit` 路由（git diff 仅剩 iot_report/mqtt/reporter 三个插件文件，App.cpp/PluginManager.cpp/HttpServer.cpp 已还原）
 - [x] 托盘图标断言：进程退出即证明 `tray_->quit()`（WM_APP+1）已执行并走到消息循环后的 `Shell_NotifyIcon(NIM_DELETE)`（该调用在 Tray::run() 消息循环 break 后无条件执行，无竞态）。Win11 托盘 flyout/提升区/UIPI 隔离下 P/Invoke 真实右键自动化未稳定跑通（中文 tooltip 编码 + 通知区窗口嵌套），以「同路径 requestQuit 压测 3/3 + NIM_DELETE 代码级论证」交付；托盘右键 WM_COMMAND kIdmQuit 与 /api/quit 调用同一 `App::requestQuit()`，路径一致
 - [x] 收尾轮 WM_COMMAND 同路径压测：最终二进制（exe 22:10 构建）上，按 pid 枚举定位 CppDaemonTrayClass 窗口 → PostMessage(WM_COMMAND, wparam=2/*kIdmQuit*/, 0)，即跳过鼠标菜单交互、但与「退出」菜单项**共用同一条 WndProc→requestQuit 分支**。连测 3 轮（启动→等 75s 真实发布→投递），退出耗时 7s/6s/7s，9801 均释放，无残留进程。**如实标注：WM_COMMAND 投递（非鼠标点击）**。真实鼠标右键自动化受 Win11 flyout/UIPI 限制未跑通；已沉淀 `tray_quit_verify.ps1` 供用户一键手动复核（启动→提示手动右键退出→自动轮询 60s 报耗时/兜底清理）
+
+## [x] iot_report 断线自动重连修复
+
+现象：运行中 publish 抛 `MQTT error [-3]: Disconnected`，catch 仅记 lastResult/lastError，不跳出回外层重连，connected_ 假 true，平台 120s 后判 offline。
+
+- [x] loop 重构为「外层连接重试 + 内层发布循环」：publish 异常（含 -3）→ connected_=false、lastResult=error、跳出内层 → teardownMqtt 清理旧连接 → 外层重连
+- [x] 抽出 `teardownMqtt()`：disconnect()->wait_for(5s) 不持 cliMu_ + 锁内 cli_.reset()，复用至 connectMqtt 失败/loop 退出/重连前
+- [x] connected_ 状态同步：断开置 false、重连成功置 true；连接建立即清 lastError_（/api/iot 快速反映恢复）
+- [x] quit_ 兼容：所有 wait_for 带 quit_ 谓词；connect wait 15s / disconnect wait 5s 有限超时；shutdown 路径不变
+- [x] 编译验证：0 error；iot_report.dll/mqtt.dll/reporter.dll/scheduler.dll/cpp-daemon.exe 正常产出
+- [x] 正常周期上报验证：/api/iot 三次采样 connected=true、last_result=ok、last_publish 从 10:03:00 → 10:04:00 连续刷新、无连续失败
+- [x] 断线模拟（手 1 改 broker 到不可达地址）未执行：用户确认服务暂不可用；以正常周期验证 + 代码级论证（发布失败 break→teardown→外层 connectMqtt 重试→恢复）交付

@@ -581,6 +581,15 @@ private:
   }
 
   // 连接 MQTT。成功返回 true；失败记日志返回 false（调用方负责重试）。
+  // 清理旧连接：wait 不持 cliMu_（避免持锁 wait 竞态），给 5s 有限超时。
+  void teardownMqtt() {
+    if (cli_) {
+      try { cli_->disconnect()->wait_for(std::chrono::seconds(5)); } catch (...) {}
+    }
+    std::lock_guard<std::mutex> lk(cliMu_);
+    cli_.reset();
+  }
+
   bool connectMqtt(const IotCfg& c) {
     std::string uri = (c.tls ? "ssl://" : "tcp://") + c.broker + ":" + std::to_string(c.port);
     std::string topic = resolveTopic(c);
@@ -605,11 +614,14 @@ private:
       // connect_timeout=10 已限制连接尝试；wait_for 给足余量，避免 quit 时无限阻塞
       raw->connect(conn)->wait_for(std::chrono::seconds(15));
       connected_ = true;
+      { std::lock_guard<std::mutex> slk(stMu_); lastError_.clear(); }
       ilog("[iot_report] 已连接 MQTT topic=%s\n", topic.c_str());
       return true;
     } catch (const std::exception& e) {
       connected_ = false;
       ilog("[iot_report] 连接失败: %s\n", e.what());
+      // 清理半创建的 client，避免下轮 connectMqtt 覆盖时析构竞态
+      teardownMqtt();
       std::lock_guard<std::mutex> lk(stMu_);
       lastError_ = std::string("连接失败: ") + e.what();
       return false;
@@ -643,47 +655,55 @@ private:
       return;
     }
 
-    // 3) 连 MQTT（失败按 interval 重试，直到成功或 quit）
-    while (!quit_ && !connectMqtt(c)) {
-      std::unique_lock<std::mutex> lk(cvMu_);
-      cv_.wait_for(lk, std::chrono::seconds(interval), [this]() { return quit_.load(); });
-    }
-    if (quit_) return;
-
+    // 3) 外层：连接重试 → 发布循环 → 断线清理 → 自动重连
     std::string topic = resolveTopic(c);
     while (!quit_) {
-      {
+      // 连接重试（失败按 interval 等待，直到成功或 quit）
+      while (!quit_ && !connectMqtt(c)) {
         std::unique_lock<std::mutex> lk(cvMu_);
         cv_.wait_for(lk, std::chrono::seconds(interval), [this]() { return quit_.load(); });
       }
       if (quit_) break;
-      std::string body = buildPayload();
-      if (body.empty()) continue;
-      try {
-        std::lock_guard<std::mutex> lk(cliMu_);
-        if (!cli_) break;
-        cli_->publish(mqtt::make_message(topic, body, 1, false));
-        std::lock_guard<std::mutex> slk(stMu_);
-        lastPublish_ = nowISO();
-        lastResult_ = "ok";
-        lastError_.clear();
-        ilog("[iot_report] 发布成功 len=%zu\n", body.size());
-      } catch (const std::exception& e) {
-        ilog("[iot_report] 发布失败: %s\n", e.what());
-        std::lock_guard<std::mutex> slk(stMu_);
-        lastResult_ = "error";
-        lastError_ = e.what();
+
+      // 内层发布循环：publish 异常（含 -3 Disconnected）→ 置 connected=false 并跳出回外层重连
+      bool publishBroken = false;
+      while (!quit_) {
+        {
+          std::unique_lock<std::mutex> lk(cvMu_);
+          cv_.wait_for(lk, std::chrono::seconds(interval), [this]() { return quit_.load(); });
+        }
+        if (quit_) break;
+        std::string body = buildPayload();
+        if (body.empty()) continue;
+        try {
+          std::lock_guard<std::mutex> lk(cliMu_);
+          if (!cli_) { publishBroken = true; break; }
+          cli_->publish(mqtt::make_message(topic, body, 1, false));
+          std::lock_guard<std::mutex> slk(stMu_);
+          lastPublish_ = nowISO();
+          lastResult_ = "ok";
+          lastError_.clear();
+          ilog("[iot_report] 发布成功 len=%zu\n", body.size());
+        } catch (const std::exception& e) {
+          ilog("[iot_report] 发布失败: %s\n", e.what());
+          connected_ = false;
+          std::lock_guard<std::mutex> slk(stMu_);
+          lastResult_ = "error";
+          lastError_ = e.what();
+          publishBroken = true;
+          break;  // 跳出内层，回外层清理旧连接并重连
+        }
+      }
+      // 清理旧连接（wait 不持 cliMu_，5s 有限超时）
+      teardownMqtt();
+      if (quit_) break;
+      // 断线后稍等再重连，避免紧密重试循环
+      if (publishBroken) {
+        std::unique_lock<std::mutex> lk(cvMu_);
+        cv_.wait_for(lk, std::chrono::seconds(interval), [this]() { return quit_.load(); });
       }
     }
-    // 断开连接：wait 不持 cliMu_（与 mqtt 插件一致），且给有限超时避免 quit 时无限阻塞。
-    if (cli_) {
-      try { cli_->disconnect()->wait_for(std::chrono::seconds(5)); } catch (...) {}
-    }
-    {
-      std::lock_guard<std::mutex> lk(cliMu_);
-      cli_.reset();
-    }
-    connected_ = false;
+    teardownMqtt();
   }
 
   static std::string nowISO() {
